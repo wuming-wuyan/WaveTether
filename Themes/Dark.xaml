@@ -1,0 +1,25 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <SolidColorBrush x:Key="Bg" Color="#0F1114" />
+    <SolidColorBrush x:Key="TitleBg" Color="#0F1114" />
+    <SolidColorBrush x:Key="FooterBg" Color="#0F1114" />
+    <SolidColorBrush x:Key="WindowBorder" Color="#23272C" />
+    <SolidColorBrush x:Key="Hairline" Color="#3A414B" />
+    <SolidColorBrush x:Key="HoverFill" Color="#1A1F25" />
+    <SolidColorBrush x:Key="SelectFill" Color="#20252C" />
+    <SolidColorBrush x:Key="Text" Color="#EDEFF2" />
+    <SolidColorBrush x:Key="TextMuted" Color="#9CA3AD" />
+    <SolidColorBrush x:Key="TextFaint" Color="#8B93A0" />
+    <SolidColorBrush x:Key="Accent" Color="#E9EBEE" />
+    <SolidColorBrush x:Key="AccentText" Color="#7F9FE0" />
+    <SolidColorBrush x:Key="AccentSoft" Color="#1D232C" />
+    <SolidColorBrush x:Key="OnAccent" Color="#14171A" />
+    <SolidColorBrush x:Key="Ok" Color="#4FC08D" />
+    <SolidColorBrush x:Key="Warn" Color="#E0B44A" />
+    <SolidColorBrush x:Key="Err" Color="#EF6B5C" />
+    <SolidColorBrush x:Key="ControlBg" Color="#0A0C0E" />
+    <SolidColorBrush x:Key="ControlBorder" Color="#5A626E" />
+    <SolidColorBrush x:Key="TrackBg" Color="#535C67" />
+
+</ResourceDictionary>

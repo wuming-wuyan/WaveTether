@@ -1,0 +1,35 @@
+#include "version.h"
+#pragma code_page(65001)
+﻿#include <windows.h>
+
+IDI_APP ICON "app.ico"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     1,0,0,0     // 必须与 version.h 的 APP_VERSION_4C 一致（rc.exe 不展开逗号宏，由 make_dist.py --verify 校验）
+PRODUCTVERSION  1,0,0,0
+FILEFLAGSMASK   0x3fL
+FILEFLAGS       0x0L
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"                    /* 简体中文, Unicode */
+        BEGIN
+            VALUE "CompanyName",      "WaveTether"
+            VALUE "FileDescription",  "WaveTether - 设备音频转发到电脑"
+            VALUE "FileVersion",      APP_VERSION_4A
+            VALUE "InternalName",     "WaveTether"
+            VALUE "OriginalFilename", "WaveTether.exe"
+            VALUE "ProductName",      "WaveTether"
+            VALUE "ProductVersion",   APP_VERSION_4A
+            VALUE "LegalCopyright",   "Copyright (C) 2026 WaveTether contributors"
+            VALUE "Comments",         "免安装版"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END

@@ -1,0 +1,13 @@
+# WaveTether 1.0.0 交付校验：sha256sum -c SHA256SUMS.txt
+# 注意：这里的 WaveTether.exe 是「单文件完整版」；
+#       压缩包里的 WaveTether.exe 是同一个程序（配 tools 用），不是同一个文件。
+7c5e2a2951156ba4ad585ed0a044d033c61c6695ab1897e5f01245d3dde81eb2  WaveTether.exe
+60466d3e0556f13de1c9f62b745599e4e1776929568d93b2fa92e7363327033d  WaveTether-BT-only.exe
+d1357d26e289df489bd6775e208dc457364bf4c4dc0b5f931b6034df549d5aea  WaveTether-1.0.0-portable.zip
+55ee863decaec90d3ce0c0610d17f8e862d069858c0d80797eb1600d093e94be  使用说明.txt
+7cf90d3d8112bc61ec384920b8462fac9a482031df799143989b870a34e45f1a  发布说明-1.0.0.txt
+b705a92b46cc86672bc92723add8325f9038da39d497e6134d9931ac8b3e93a0  LICENSE-WaveTether.txt
+c921b780b27975bc235579f588d83974cae42bf5c9b65a3487f23aa7d5df5ade  THIRD-PARTY-NOTICES.txt
+01c12035bf35af37241298dc7ad538eb2a07e5c940437bc6876feeaa9d1951d0  LICENSE-Apache-2.0.txt
+5749785c8bdefafcb5d798270ed0a967036fe2ca63dcedade1627565dfef81d2  LICENSE-LGPL-2.1.txt
+bfb1112d49db5b1daecdfef24bd7e2f3ea0bafb33aa67aa0ab51e2bf8407c03d  LICENSE-Zlib.txt

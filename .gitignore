@@ -1,0 +1,28 @@
+# 构建中间产物
+native/obj/
+native/embed_blobs/
+native/embed.rc
+native/embed_manifest.txt
+native/embed_hash.txt
+native/*.obj
+native/*.res
+native/WaveTether.exe
+native/WaveTether-single.exe
+native/test_*.exe
+native/*.log
+
+# 打包产物
+dist/*.exe
+dist/*.zip
+
+# 第三方工具压缩包
+native/tools/scrcpy/*.zip
+
+# 本地目录
+history/
+shots/
+.local/agent-work/
+
+# 系统文件
+Thumbs.db
+.DS_Store

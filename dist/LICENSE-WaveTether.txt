@@ -1,0 +1,73 @@
+WaveTether License (Source-Available, Use-Only)
+Version 1.0, 2026-10-31
+
+Copyright (c) 2026 wuming-wuyan. All rights reserved.
+
+This license applies to WaveTether and its source code, except for the
+third-party components identified in Section 3.
+
+1. Grant
+
+Subject to the terms of this license, you are granted a worldwide,
+royalty-free, non-exclusive, non-transferable license to:
+
+  (a) use and run WaveTether, in source or binary form, for any purpose,
+      including personal, internal business, and commercial use; and
+  (b) modify the source code and run your modified version privately.
+
+No other rights are granted.
+
+2. Restrictions
+
+You may not:
+
+  (a) distribute, publish, sublicense, sell, rent, or otherwise make
+      WaveTether or any modified version available to any third party,
+      in source or binary form;
+  (b) use WaveTether to provide a hosted or managed service to third
+      parties; or
+  (c) remove or alter any copyright, license, or attribution notice.
+
+Sharing a link to the official repository or the official releases is
+permitted and does not count as distribution under this license.
+
+3. Third-party components
+
+WaveTether includes third-party components, including the tools under
+`native/tools/scrcpy/` (scrcpy, FFmpeg, SDL3, ADB and related libraries).
+Those components are licensed under their own terms, reproduced in
+`dist/THIRD-PARTY-NOTICES.txt` and the license files under `dist/` and
+`native/tools/scrcpy/`. Nothing in this license restricts any rights you
+have under those third-party licenses. In case of conflict, the
+third-party license governs those components.
+
+4. Trademarks
+
+This license grants no rights to use the names, logos, or trademarks of
+the copyright holder, except as required for accurate attribution.
+
+5. Termination
+
+Any breach of this license terminates it automatically. On termination
+you must stop using WaveTether and delete all copies in your possession
+or control.
+
+6. No warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND
+NON-INFRINGEMENT.
+
+7. Limitation of liability
+
+IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES,
+OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR
+OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR
+ITS USE.
+
+8. Revisions
+
+The copyright holder may publish revised versions of this license with
+future releases. Each release remains governed by the license included
+with that release.

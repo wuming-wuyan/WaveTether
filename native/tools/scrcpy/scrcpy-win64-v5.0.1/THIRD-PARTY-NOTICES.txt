@@ -1,0 +1,98 @@
+WaveTether 第三方组件与许可声明
+================================
+
+WaveTether 本体是本项目自己的代码。它调用的 adb / scrcpy 及其依赖属于第三方开源软件，
+版权归各自作者所有，按下列许可分发。本程序**没有修改**这些二进制文件。
+
+一、组件清单（版本取自 scrcpy.exe --version 与随包文件）
+------------------------------------------------------------------
+1) scrcpy 5.0.1                                        Apache License 2.0
+   https://github.com/Genymobile/scrcpy
+   随包文件：scrcpy.exe、scrcpy-server
+
+2) Android SDK Platform Tools（adb）                   Apache License 2.0
+   https://developer.android.com/tools/releases/platform-tools
+   随包文件：adb.exe、AdbWinApi.dll、AdbWinUsbApi.dll
+
+3) FFmpeg                                             LGPL-2.1-or-later
+   libavcodec 63.1.102 / libavformat 63.1.102 / libavutil 61.1.102 / libswresample
+   https://ffmpeg.org/
+   随包文件：avcodec-63.dll、avformat-63.dll、avutil-61.dll、swresample-7.dll
+
+4) SDL 3.4.18                                         Zlib License
+   https://libsdl.org/
+   随包文件：SDL3.dll
+
+5) libusb 1.0.30                                      LGPL-2.1-or-later
+   https://libusb.info/
+   随包文件：libusb-1.0.dll
+
+二、许可全文
+------------------------------------------------------------------
+**便携版**（`dist\` 与 zip 内）：与本文件同目录：
+  LICENSE-Apache-2.0.txt    （scrcpy、adb 适用）
+  LICENSE-LGPL-2.1.txt      （FFmpeg、libusb 适用）
+  LICENSE-Zlib.txt          （SDL 适用）
+
+**单文件版**：首次运行时释放到
+  %TEMP%\WaveTether\rt-<内容哈希>\tools\scrcpy\scrcpy-win64-v5.0.1\
+  上述三份同样在里面（其中 Apache 那份沿用了上游发行包的原名 LICENSE.txt，
+  内容与 LICENSE-Apache-2.0.txt 逐字节相同）。
+
+为了避免「指向的文件恰好不在手边」导致义务悬空，Zlib 许可正文直接附在下面。
+
+---------- Zlib License 正文 ----------
+
+zlib License
+
+This software is provided 'as-is', without any express or implied warranty.
+In no event will the authors be held liable for any damages arising from the
+use of this software.
+
+Permission is granted to anyone to use this software for any purpose,
+including commercial applications, and to alter it and redistribute it
+freely, subject to the following restrictions:
+
+     1. The origin of this software must not be misrepresented; you must not
+        claim that you wrote the original software. If you use this software
+        in a product, an acknowledgment in the product documentation would be
+        appreciated but is not required.
+
+     2. Altered source versions must be plainly marked as such, and must not
+        be misrepresented as being the original software.
+
+     3. This notice may not be removed or altered from any source
+        distribution.
+
+---------- Zlib 正文结束 ----------
+
+三、关于 LGPL 组件（FFmpeg、libusb）—— 重点
+------------------------------------------------------------------
+LGPL-2.1 第 6 条规定：以动态链接库形式分发时，必须
+  a) 随附许可全文；
+  b) 声明这些库未经修改；
+  c) 允许使用者用自己编译的兼容版本替换这些库。
+
+本次分发按下列方式满足：
+
+  · 便携版：DLL 就在 tools\scrcpy\scrcpy-win64-v5.0.1\ 目录下。
+    用同名的新版本 DLL 直接覆盖即可替换，不需要重新编译、也不需要改动 WaveTether。
+
+  · 单文件版：程序首次运行时把同一批 DLL 释放到
+    %TEMP%\WaveTether\rt-<内容哈希>\ 下，同样可以用同名新版本覆盖替换。
+    如果想长期固定某个版本，改用便携版即可。
+
+  · 这些 DLL 全部是 scrcpy 官方 Windows 发行包里的原样文件，未做任何修改。
+
+  · 程序启动时会检查这些文件的大小是否与内嵌清单一致；被替换成大小不同的文件时，
+    单文件版会重新释放一份自己的副本（不会静默使用被替换的文件）。
+
+四、源码获取
+------------------------------------------------------------------
+  scrcpy   https://github.com/Genymobile/scrcpy
+  adb      https://android.googlesource.com/platform/packages/modules/adb
+  FFmpeg   https://ffmpeg.org/download.html
+  SDL      https://github.com/libsdl-org/SDL
+  libusb   https://github.com/libusb/libusb
+
+如需与随包二进制完全对应的源码，请按上述地址取对应 tag / 版本号。
