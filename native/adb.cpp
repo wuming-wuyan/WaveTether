@@ -97,10 +97,46 @@ static bool FileExists(const std::wstring& p)
 
 void AdbChannel::Post(std::function<void()> fn)
 {
+    // 上限只是兜底：工作线程被一次卡住的 adb 调用拖住时，UI 每 250ms 投递的
+    // 任务会无限堆积（每个 lambda 捕获 wstring，内存跟着涨）。
+    static const size_t kMaxQueued = 64;
+    std::lock_guard<std::mutex> lk(qmtx_);
+    if (queue_.size() >= kMaxQueued)
     {
-        std::lock_guard<std::mutex> lk(qmtx_);
-        queue_.push_back(std::move(fn));
+        static int dropped = 0;
+        ++dropped;
+        if (dropped == 1 || dropped % 100 == 0)
+            PerfLog("ADB 队列已满（%zu），已丢弃 %d 个任务", queue_.size(), dropped);
+        return;
     }
+    queue_.push_back({ JobKind::Generic, std::move(fn) });
+}
+
+bool AdbChannel::PostCritical(std::function<void()> fn)
+{
+    // 用户操作与带忙标志的任务不受普通上限约束：数量由点击次数决定，不会自增长。
+    // 仍然留一个硬上限：工作线程彻底卡死时，至少不会把内存吃光。
+    static const size_t kMaxCritical = 256;
+    std::lock_guard<std::mutex> lk(qmtx_);
+    if (queue_.size() >= kMaxCritical)
+    {
+        static int dropped = 0;
+        if (++dropped == 1 || dropped % 100 == 0)
+            PerfLog("ADB 关键队列已达 %zu，丢弃 %d 个（工作线程可能卡住）", queue_.size(), dropped);
+        return false;
+    }
+    queue_.push_back({ JobKind::Critical, std::move(fn) });
+    return true;
+}
+
+void AdbChannel::PostProbe(std::function<void()> fn)
+{
+    static const size_t kMaxQueued = 64;
+    std::lock_guard<std::mutex> lk(qmtx_);
+    for (auto& j : queue_)
+        if (j.kind == JobKind::Probe) return;      // 已有一个待跑的探测，合并掉
+    if (queue_.size() >= kMaxQueued) return;
+    queue_.push_back({ JobKind::Probe, std::move(fn) });
 }
 
 void AdbChannel::StartWorker()
@@ -123,14 +159,14 @@ void AdbChannel::StartWorker()
             // 1) 执行 UI 投递的任务
             for (;;)
             {
-                std::function<void()> fn;
+                QueuedJob job{ JobKind::Generic, {} };
                 {
                     std::lock_guard<std::mutex> lk(qmtx_);
                     if (queue_.empty()) break;
-                    fn = std::move(queue_.front());
+                    job = std::move(queue_.front());
                     queue_.pop_front();
                 }
-                if (fn) { fn(); UpdateSnapshot(); }
+                if (job.fn) { job.fn(); UpdateSnapshot(); }
             }
 
             // 2) 周期性维护（全部是 adb IO）
@@ -142,8 +178,8 @@ void AdbChannel::StartWorker()
                 KnownWirelessTick();
                 DedupRunningSessions();
                 {
-                    static int pruneTick = 0;
-                    if (++pruneTick >= 1200) { pruneTick = 0; PruneBookkeeping(); }
+                    static PeriodicGate pruneGate;
+                    if (pruneGate.Due(5 * 60 * 1000)) PruneBookkeeping();
                 }
                 AdaptTick();
             }
@@ -176,7 +212,8 @@ void AdbChannel::RequestUpgradeForBt(const std::wstring& btName, const std::stri
     std::wstring name = btName;
     std::string mac = btMac;
     upgradeResult_ = 0;
-    Post([this, name, mac]()
+    // 注意：upgradeInFlight_ 已经置位，任务必须送达，否则本会话永久卡在「升级中」。
+    if (!PostCritical([this, name, mac]()
     {
         // 无论从哪个分支 return，都要复位 in-flight；失败还要退避 20 秒，
         // 避免「每 5 秒重启一次 adb server + 扫一遍全网段」。
@@ -291,7 +328,11 @@ void AdbChannel::RequestUpgradeForBt(const std::wstring& btName, const std::stri
         setFail(L"升级失败：已试过记录地址、mDNS、局域网扫描，并重启过一次 adb，"
                     L"仍找不到这台设备。请确认手机和电脑在同一网络、手机无线调试已打开；"
                     L"也可以用「无线调试配对」直接填地址连接。");
-    });
+    }))
+    {
+        upgradeInFlight_ = false;
+        upgradeNextAt_ = GetTickCount64() + 20000;
+    }
 }
 
 
@@ -321,7 +362,8 @@ void AdbChannel::SetupKillOnCloseJob()
 void AdbChannel::SetDualChannel(bool on)
 {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
-    if (dualChannel_ == on) return;
+    // 标志可能已经由 UI 线程先改过（SetDualChannelWant），这里不再提前返回：
+    // 关闭时清理备用通道是幂等的，必须每次都走到。
     dualChannel_ = on;
     if (!on)
     {
@@ -396,7 +438,7 @@ void AdbChannel::MaintainStandby()
             delete pi;
             kv.second = nullptr;
             // 备用秒退同样要退避，避免双通道下 4Hz spawn 风暴
-            standbyRetryAt_[kv.first] = GetTickCount() + 15000;
+            standbyRetryAt_[kv.first] = GetTickCount64() + 15000;
         }
     }
     for (auto it = standby_.begin(); it != standby_.end();)
@@ -405,7 +447,7 @@ void AdbChannel::MaintainStandby()
         else ++it;
     }
     // 为每个运行中的设备确保有备用
-    DWORD now = GetTickCount();
+    ULONGLONG now = GetTickCount64();
     for (auto& sess : sessions_)
     {
         if (!sess.running) continue;
@@ -812,10 +854,10 @@ bool AdbChannel::Init(const std::wstring& appDirIn, bool probeOnly)
 
     if (adbPath_.empty())
     {
-        wchar_t buf[32767]{};
-        if (GetEnvironmentVariableW(L"PATH", buf, 32767) > 0)
+        std::vector<wchar_t> buf(32767, 0);
+        if (GetEnvironmentVariableW(L"PATH", buf.data(), 32767) > 0)
         {
-            std::wstring path = buf;
+            std::wstring path(buf.data());
             size_t p = 0;
             while (p <= path.size() && adbPath_.empty())
             {
@@ -1081,12 +1123,12 @@ void AdbChannel::Probe()
     }
 
     // 已有无线设备在线时直接采纳，这样拔掉 USB、重启程序后仍能升级到 ADB
-    if (wirelessIp_.empty())
+    if (WirelessIp().empty())
         for (auto& d : devices_)
             if (d.state == "device" && !d.isWired)
             {
                 size_t c = d.serial.find(':');
-                if (c != std::string::npos) wirelessIp_ = d.serial.substr(0, c);
+                if (c != std::string::npos) SetWirelessIp(d.serial.substr(0, c));
                 break;
             }
 
@@ -1504,7 +1546,7 @@ void AdbChannel::AdaptTick()
 {
     std::lock_guard<std::recursive_mutex> _lk(mtx_);
     if (!autoAdapt_) return;
-    if (++adaptTick_ % 8 != 0) return;      // 250ms tick → 2 秒
+    if (!adaptGate_.Due(2000)) return;
 
     const int kWin = 2;                      // 2 秒窗口
 
@@ -1601,8 +1643,8 @@ void AdbChannel::ScheduleRestart(const std::string& serial, DWORD delayMs)
 {
     std::lock_guard<std::recursive_mutex> _lk(mtx_);
     for (auto& p : pending_)
-        if (p.serial == serial) { p.dueMs = GetTickCount() + delayMs; return; }
-    pending_.push_back({ serial, GetTickCount() + delayMs });
+        if (p.serial == serial) { p.dueMs = GetTickCount64() + delayMs; return; }
+    pending_.push_back({ serial, GetTickCount64() + delayMs });
 }
 
 // 让手机端媒体流重新建立。
@@ -1629,7 +1671,7 @@ void AdbChannel::ProcessPendingRestarts()
 {
     std::lock_guard<std::recursive_mutex> _lk(mtx_);
     if (pending_.empty()) return;
-    DWORD now = GetTickCount();
+    ULONGLONG now = GetTickCount64();
     for (auto it = pending_.begin(); it != pending_.end();)
     {
         if (now < it->dueMs) { ++it; continue; }
@@ -1686,16 +1728,17 @@ void AdbChannel::ReconnectKnownWireless(bool force)
         if (!loggedEmpty) { loggedEmpty = true; PerfLog("ADB KnownWireless: 集合为空，永不尝试无线重连"); }
         return;
     }
-    if (!force && ++knownTick_ % 240 != 0) return;   // 250ms tick → 60 秒
+    if (!force && !knownGate_.Due(60000)) return;   // 60 秒一轮
+    ++knownAttempt_;
     if (force)
     {
         retryAt_.clear(); failCount_.clear();               // 手动点刷新：退避归零，立刻试
         manualUntil_ = GetTickCount64() + 60000;            // 顺带给自动起会话开 60 秒口子
     }
-    PerfLog("ADB KnownWireless: 第 %d 次触发，已知 %zu 个 IP", knownTick_, knownWireless_.size());
+    PerfLog("ADB KnownWireless: 第 %d 次触发，已知 %zu 个 IP", knownAttempt_, knownWireless_.size());
 
     bool changed = false;
-    DWORD now = GetTickCount();
+    ULONGLONG now = GetTickCount64();
 
     // 先筛出「需要尝试」的候选，再按失败次数排序。
     // 原来的写法有两个坑：
@@ -1731,11 +1774,11 @@ void AdbChannel::ReconnectKnownWireless(bool force)
 
     // 一轮最多试 4 台 / 总预算 8 秒：够覆盖多设备，又不会长时间持着 mtx_
     int tried = 0, failed = 0;
-    DWORD budgetStart = now;
+    ULONGLONG budgetStart = now;
     for (auto& ser : cand)
     {
         if (tried >= 4) break;
-        if (GetTickCount() - budgetStart > 8000) { PerfLog("ADB KnownWireless: 本轮预算用完，剩 %zu 台下轮再试", cand.size() - tried); break; }
+        if (GetTickCount64() - budgetStart > 8000) { PerfLog("ADB KnownWireless: 本轮预算用完，剩 %zu 台下轮再试", cand.size() - tried); break; }
         ++tried;
         if (ConnectWireless(ser, 2500)) { changed = true; failCount_.erase(ser); retryAt_.erase(ser); }
         else
@@ -1743,7 +1786,7 @@ void AdbChannel::ReconnectKnownWireless(bool force)
             ++failed;
             int& fails = failCount_[ser];
             fails = (std::min)(fails + 1, 6);
-            retryAt_[ser] = now + (DWORD)(std::min)(60000u << (fails - 1), 1800000u);
+            retryAt_[ser] = now + (std::min)(60000ull << (fails - 1), 1800000ull);
 
             // 以前这里「连续失败 6 次就删掉这条 IP」。问题是很久没开机、或者
             // mDNS 恰好失效时，地址会被删掉，等设备真回来了反而没有地址可试。
@@ -1783,8 +1826,9 @@ void AdbChannel::ReconnectTick()
         if (!loggedWantedEmpty) { loggedWantedEmpty = true; PerfLog("ADB Reconnect: wanted_ 为空，断线自愈不工作"); }
         return;
     }
-    if (++reconnectTick_ % 20 != 0) return;    // 250ms tick → 5 秒
-    PerfLog("ADB Reconnect: 第 %d 次触发，wanted_=%zu 个", reconnectTick_, wanted_.size());
+    if (!reconnectGate_.Due(5000)) return;     // 5 秒一轮
+    ++reconnectAttempt_;
+    PerfLog("ADB Reconnect: 第 %d 次触发，wanted_=%zu 个", reconnectAttempt_, wanted_.size());
 
     bool needProbe = false;
 
@@ -1792,7 +1836,7 @@ void AdbChannel::ReconnectTick()
     std::vector<std::pair<std::string, std::string>> renamed;   // (旧 serial, 新 serial)
     std::vector<std::string> toStart;
 
-    DWORD now = GetTickCount();
+    ULONGLONG now = GetTickCount64();
     // 同 KnownWirelessTick：持着 mtx_ 做同步 adb 调用，一轮最多处理一台，
     // 否则 N 台设备全掉线时界面会连续冻结 N × (connect 超时 + 网段扫描)。
     bool handledOne = false;
@@ -1837,7 +1881,7 @@ void AdbChannel::ReconnectTick()
                     // 连不上：指数退避（5s→10s→20s→40s→80s→160s→300s 上限）
                     int& fails = failCount_[ser];
                     fails = (std::min)(fails + 1, 8);
-                    DWORD wait = (DWORD)(std::min)(5000u << (fails - 1), 300000u);
+                    ULONGLONG wait = (std::min)(5000ull << (fails - 1), 300000ull);
                     retryAt_[ser] = now + wait;
                     continue;
                 }
@@ -1855,7 +1899,7 @@ void AdbChannel::ReconnectTick()
             {
                 int& fails = failCount_[ser];
                 fails = (std::min)(fails + 1, 8);
-                DWORD wait = (DWORD)(std::min)(5000u << (fails - 1), 300000u);
+                ULONGLONG wait = (std::min)(5000ull << (fails - 1), 300000ull);
                 retryAt_[ser] = now + wait;
                 continue;
             }
@@ -1880,7 +1924,7 @@ void AdbChannel::ReconnectTick()
         {
             int& fails = failCount_[ser];
             fails = (std::min)(fails + 1, 8);
-            retryAt_[ser] = now + (DWORD)(std::min)(5000u << (fails - 1), 300000u);
+            retryAt_[ser] = now + (std::min)(5000ull << (fails - 1), 300000ull);
         }
     }
 
@@ -1961,7 +2005,7 @@ std::string AdbChannel::RediscoverWireless(const std::wstring& btName, bool forc
     std::lock_guard<std::recursive_mutex> _lk(mtx_);
     // 自动重连才看这个开关；用户手动点「↑ADB」时 force=true，应该允许扫一次
     if (!lanScan_ && !force) return {};
-    std::string hint = wirelessIp_;
+    std::string hint = WirelessIp();
     if (hint.empty()) return {};
 
     auto ips = netscan::ScanAdbPorts(hint, 600);
@@ -1978,7 +2022,7 @@ std::string AdbChannel::RediscoverWireless(const std::wstring& btName, bool forc
         std::string bn = Trim(RunAdb("-s " + target + " shell settings get secure bluetooth_name", 3000));
         if (!want.empty() && bn == want)
         {
-            wirelessIp_ = ip;      // 记住新 IP
+            SetWirelessIp(ip);      // 记住新 IP
             return target;
         }
         RunAdb("disconnect " + target, 3000);   // 不是这台，断开
@@ -2139,8 +2183,8 @@ void AdbChannel::Tick()
             {
                 int& fails = failCount_[ser];
                 fails = (std::min)(fails + 1, 6);
-                DWORD wait = (DWORD)(std::min)(30000u << (fails - 1), 600000u);
-                retryAt_[ser] = GetTickCount() + wait;
+                ULONGLONG wait = (std::min)(30000ull << (fails - 1), 600000ull);
+                retryAt_[ser] = GetTickCount64() + wait;
                 lastError_ = "scrcpy 启动后立即退出(code " + std::to_string(code) + ")";
             }
             continue;
@@ -2264,7 +2308,7 @@ void AdbChannel::ConnectDirectAsync(const std::string& addr)
 {
     if (addr.empty()) return;
     upgradeResult_ = 0;
-    Post([this, addr]()
+    if (!PostCritical([this, addr]()
     {
         bool ok = ConnectWireless(addr, 6000);   // 失败时会顺手 disconnect，避免留 offline 幽灵
         Probe();
@@ -2280,7 +2324,12 @@ void AdbChannel::ConnectDirectAsync(const std::string& addr)
         upgradeStatus_ = ok ? L"已连接。"
                             : (L"连不上 " + Widen(addr) + L"：手机上的无线调试可能没开，或端口变了。");
         upgradeResult_ = ok ? 1 : 2;
-    });
+    }))
+    {
+        std::lock_guard<std::mutex> lk(pairMtx_);
+        upgradeStatus_ = L"后台任务队列已满，连接没有发起，请稍后重试。";
+        upgradeResult_ = 2;
+    }
 }
 
 void AdbChannel::PairWirelessAsync(const std::string& addr, const std::string& code, const std::string& portHint)
@@ -2302,7 +2351,8 @@ void AdbChannel::PairWirelessAsync(const std::string& addr, const std::string& c
         pairStatus_ = t;
     };
 
-    Post([this, addr, code, portHint, setStatus]()
+    // 同理：pairBusy_ 已置位，任务必须送达（guard 在任务结束时才清）。
+    if (!PostCritical([this, addr, code, portHint, setStatus]()
     {
         struct BusyGuard {
             std::atomic<bool>* f; ~BusyGuard() { *f = false; }
@@ -2419,7 +2469,12 @@ void AdbChannel::PairWirelessAsync(const std::string& addr, const std::string& c
             pairResult_ = 2;
             setStatus(L"配对已成功，但没找到连接端口。请在手机的「无线调试」页查看当前的 IP:端口，填到第三栏后点「配对」。");
         }
-    });
+    }))
+    {
+        pairBusy_ = false;
+        std::lock_guard<std::mutex> lk(pairMtx_);
+        pairStatus_ = L"任务队列已满，请稍后重试。";
+    }
 }
 
 

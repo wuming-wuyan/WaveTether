@@ -44,7 +44,7 @@ enum : int
     ID_MOVE_UP, ID_MOVE_DOWN, ID_REFRESH_OUT, ID_SOUND_SETTINGS,
     ID_AUTOSTART, ID_AUTOCONNECT, ID_SETTINGS, ID_LOG, ID_QUIT,
     ID_SET_CLOSE_TRAY, ID_SET_CLOSE_EXIT, ID_SET_MIN_TRAY, ID_SET_MIN_TASKBAR,
-    ID_SET_LANSCAN, ID_SET_AUTORECONN, ID_SET_AUTOADAPT, ID_SET_SILENT, ID_SET_BODY,
+    ID_SET_LANSCAN, ID_SET_AUTORECONN, ID_SET_AUTOARM, ID_SET_AUTOADAPT, ID_SET_SILENT, ID_SET_BODY,
     ID_SET_IDLERESET, ID_SET_DUAL, ID_SET_AUTODUAL, ID_SET_AUTOUP, ID_WIZ_CLOSE, ID_WIZ_HELP,ID_DEV_AUTO,
     ID_SET_GEAR_BASE, ID_SET_GEAR_1 = ID_SET_GEAR_BASE + 1, ID_SET_GEAR_2 = ID_SET_GEAR_BASE + 2, ID_SET_GEAR_3 = ID_SET_GEAR_BASE + 3,
     ID_SET_DONE,
@@ -104,19 +104,77 @@ static std::vector<RowItem> CurrentRows();
 
 enum HelpTopic { HELP_NONE = 0, HELP_CHANNEL, HELP_PAIR, HELP_VOLUME, HELP_OUTPUT, HELP_FIXED, HELP_MULTI, HELP_STATUS, HELP_TROUBLE, HELP_WHY, HELP_RUNTIME };
 
-struct App
+// 设备的音量/静音键。
+// **必须用 identity（ro.serialno）**，不能用 serial：
+// 同一台手机可能以 ip:5555、随机端口、或 mDNS 名字三种 serial 出现，
+// 用 serial 做键会变成三条互不相干的记录，换条链路音量就不跟着走。
+static std::wstring AdbVolKey(const AdbDevice& d)
 {
-    ULONGLONG perfClickAt = 0;      // 临时诊断：最近一次点击的时间
-    Theme th = LightTheme();   // 默认浅色，和 settings 里 themeLight=true 保持一致
-    HDC memDC = nullptr;
-    HBITMAP memBmp = nullptr;
-    int memW = 0, memH = 0;
-    float dpi = 1.f;
+    return L"adb:" + Utf8ToWide(d.identity.empty() ? d.serial : d.identity);
+}
+// 蓝牙的音量/静音键：MAC 优先。
+// 用名字做键的话，设备一改名，之前调好的音量就“丢了”（其实还在，只是对不上）。
+static std::wstring BtVolKey(const std::wstring& name, const std::string& mac)
+{
+    return mac.empty() ? (L"bt:" + name) : (L"bt:" + Utf8ToWide(mac));
+}
+// 把 from 键的值搬到 to 键（to 已有值就不覆盖），返回是否搬过。
+// dst/src 可以不同：旧键表 → 当前键表就是这么用的。
+template <class D, class S>
+static bool MoveKey(D& dst, S& src, const std::wstring& from, const std::wstring& to)
+{
+    auto it = src.find(from);
+    if (it == src.end()) return false;
+    if (!dst.count(to)) dst[to] = it->second;
+    else PerfLog("音量键迁移：目标键已有值，丢弃旧键 %s", PerfU8(from).c_str());
+    src.erase(it);
+    return true;
+}
+template <class M>
+static bool MoveKey(M& m, const std::wstring& from, const std::wstring& to)
+{
+    return MoveKey(m, m, from, to);
+}
+// 音量一律量化到整百分比：内部还是 0..1 浮点（WASAPI 需要），
+// 但取值只有 0%、1%、…、100% 这 101 档，不会再出现 0.102499 这种小数。
+static float QuantizeVol(float v)
+{
+    if (v < 0.f) v = 0.f;
+    if (v > 1.f) v = 1.f;
+    return (float)((int)(v * 100.f + 0.5f)) / 100.f;
+}
 
-    BtLink bt;
-    OutputAudio oa;
-    AdbChannel adb;
+struct ConfigState
+{
+    float phoneVol = 0.5f;    // 滑块 = 手机那一路的会话音量（不碰系统全局音量）
+    bool phoneMute = false;   // 仅静音手机那一路
+    int volMode = 1;                                  // 0=全局  1=单个（默认单个，直接调对这台）
+    bool themeLight = true;    // 默认浅色
+    // 默认关：连接时自动切系统默认输出。
+    // 之所以默认关：切换是整机生效的（Windows 不支持按程序分设备），
+    // 一旦程序异常退出没还原，用户会「整机没声音且找不到原因」——
+    // 而他会去修电脑，不会想到是这个软件。要自动切的人自己勾。
+    bool fixedMode = false;
+    // 崩溃后还原默认输出用：routeDirty = 当前处于「我们把默认设备切走了、还没还原」。
+    // 只靠这两个条件还原：① 上次脏退出 ② 当前默认 == routeTarget。
+    std::wstring routeTarget;
+    std::wstring routePrev;
+    bool routeDirty = false;
+    std::wstring settingsPath;
+    std::wstring lastDeviceId, lastDeviceName;
+    bool autoStart = false, autoConnect = true;
+    bool silentStart = true;   // 开机自启后是否静默进托盘
+    bool idleReset = true;     // 缓冲变更/重建是否只在空闲（没在播放）时做
+    bool autoUpgrade = true;   // 蓝牙连上后是否自动升级到 ADB 音频（手动按钮不受此开关影响）
+    bool autoReconnect = true; // 运行期间设备掉线是否自动连回来（关掉 = 开关 WiFi 即断开）
+    bool autoArmWireless = true; // 插 USB 时是否自动执行 adb tcpip 5555（会开手机 5555 端口）
+    bool showWizard = false;   // 首次设置向导
+    bool setupDone = false;    // 是否已完成过首次设置
+    std::wstring closeAction = L"tray", minAction = L"taskbar";   // 最小化默认回任务栏（不是收托盘）
+};
 
+struct DeviceState
+{
     std::vector<SinkDevice> btDevs;
     int btSel = -1;
     std::vector<OutDevice> outs;
@@ -124,12 +182,6 @@ struct App
     std::vector<bool> prioOn;            // 是否勾选（与 prio 同序）
     int prioSel = -1;
     std::vector<std::wstring> prioOrder; // 全量（含未勾选）
-
-    PhoneSessionInfo session;
-    float phoneVol = 0.5f;    // 滑块 = 手机那一路的会话音量（不碰系统全局音量）
-    bool phoneMute = false;   // 仅静音手机那一路
-    std::vector<PhoneSessionInfo> phoneSessions;   // 多设备：每台一个会话
-
     // ---- 逐设备音量 ----
     struct DevVolEntry
     {
@@ -144,13 +196,59 @@ struct App
     std::vector<DevVolEntry> devVols;                 // 当前可调的设备音量（每帧刷新）
     std::map<std::wstring, float> devVolPref;         // 持久化：设备 → 音量
     std::map<std::wstring, bool>  devMutePref;        // 持久化：设备 → 静音
-
+    // 升级前的旧键（adb:<ip:port>）：加载时从上面两张表里摘出来，等设备上线再迁到
+    // identity 键上。没等到的会随设置写回（上限 16 条），不会因为这次没连就丢。
+    std::map<std::wstring, float> legacyVol;
+    std::map<std::wstring, bool>  legacyMute;
     // 蓝牙设备历史：MAC → 当前名字。MAC 不变，名字会变，所以键用 MAC。
     // 蓝牙页 = 这份历史 ∪ 当前枚举结果，按 MAC 去重 —— 这样「连接过的设备」都会一直显示。
     std::map<std::string, std::wstring> btHistory;
     bool btHistoryDirty = false;
     ULONGLONG deleteArmedUntil = 0;   // 「删除」二次确认的截止时间
+    int adbSel = 0;                                   // ADB 列表选中项
+    bool volSelInit = false;                          // 启动时是否已自动选中过
+    // ADB 设备身份 -> 蓝牙名（同一台设备用蓝牙名显示）
+    std::map<std::wstring, std::wstring> btNames;   // identity → 蓝牙名
+    std::map<std::wstring, std::wstring> btMacs;    // identity → 蓝牙 MAC（用于并入总设备列表）
+    // 「删除」过的设备（存 MAC，没有 MAC 时存 identity）。
+    // 作用：只在 ADB 出现过的设备，删掉后不会被每 4 秒的同步重新学回来。
+    // 用户在 ADB 页重新勾选、或点 ↑ADB 时解除。
+    std::set<std::string> btDeleted;
+    std::set<std::string> userStopped;   // 用户手动点了 ■ 的设备，不再自动启动
+    std::set<std::string> autoDevices;   // 勾选「自动连接」的设备（存 identity，IP 变化不影响）
+    // 静音自愈：{serial → {本次会话启动时刻, 是否已尝试过, 是否曾出过声}}
+    struct HealState
+    {
+        DWORD spawnMs = 0;
+        DWORD silentSince = 0;    // 从什么时候开始完全没声音（0 = 有声音）
+        DWORD lastNudge = 0;      // 上次自愈时刻（限流）
+        bool  diagDone = false;   // 本轮静音是否已经记过现场
+    };
+    std::map<std::string, HealState> healState;
+};
 
+struct AudioState
+{
+    PhoneSessionInfo session;
+    std::vector<PhoneSessionInfo> phoneSessions;   // 多设备：每台一个会话
+    // ---- 运行状态（这些字段原本在音量块之后，重构时被误删，此处补回）----
+    bool useAdb = false;
+    std::wstring currentDefaultId, currentDefaultName;
+    bool routed = false;
+    std::wstring routedPrev;
+    volatile LONG phonePlaying = 0; // 手机端是否真有音频在播（后台线程写，UI 读）
+    // 工作线程不能直接操作 BtLink（WinRT 对象是 STA 亲和的，跨线程会崩）。
+    // 这里只置请求，真正的断开在 UI 线程的定时器里做。
+    std::atomic<bool> btDisconnectRequest{ false };
+};
+
+struct UiState
+{
+    Theme th = LightTheme();   // 默认浅色，和 settings 里 themeLight=true 保持一致
+    HDC memDC = nullptr;
+    HBITMAP memBmp = nullptr;
+    int memW = 0, memH = 0;
+    float dpi = 1.f;
     // 无线调试配对对话框（Android 11+）
     HIMC savedImeCtx = nullptr;   // 打开配对框前的输入法上下文，关闭时恢复
     bool pairOpen = false;
@@ -158,26 +256,48 @@ struct App
     std::wstring pairAddr, pairCode, pairPort;
     std::wstring pairStatusLocal;              // 本地即时反馈（点「配对」后立刻显示）
     RECTF noticeBtnRect;                       // 标题栏提示条里动作按钮的位置（NCHITTEST 用）
-    int volMode = 1;                                  // 0=全局  1=单个（默认单个，直接调对这台）
-    int adbSel = 0;                                   // ADB 列表选中项
-    bool volSelInit = false;                          // 启动时是否已自动选中过
+    // 统一的播放/连接状态文本（标题栏与音量卡共用同一套口径）
+    struct StatusInfo { std::wstring text; COLORREF color; bool playing = false; };
+    // adbHint 会被工作线程（Post 的 lambda）写、UI 线程读，std::wstring 不能裸并发
+    std::wstring adbHint;
+    mutable std::mutex hintMtx_;
+    std::vector<Hit> hits;
+    int hover = ID_NONE, hoverIdx = -1;
+    int pressed = ID_NONE, pressedIdx = -1;
+    int scrollDev = 0, scrollPrio = 0;
+    bool dragSlider = false;
+    bool settingsOpen = false;
+    bool helpOpen = false;
+    int helpTopic = HELP_CHANNEL;
+    float helpScroll = 0.f;
+    NOTIFYICONDATAW nid{};
+    bool trayAdded = false;
+    PeriodicGate probeGate;    // 运行中设备列表探测（6 秒）
+    PeriodicGate adoptGate;    // 接管外部 scrcpy 的检查（4 秒）
+    PeriodicGate btScanGate;   // 蓝牙列表刷新（60 秒）
+    // 顶部提示条（把关键问题从「淡灰小字」变成「醒目横幅」）
+    mutable std::mutex noticeMtx_;
+    std::wstring noticeText;
+    int  noticeLevel = 0;          // 0=信息(蓝) 1=警告(黄) 2=错误(红)
+    ULONGLONG noticeUntil = 0;     // 临时提示的过期时间（用 64 位，避免 49.7 天回绕后提示条永久卡住）
+    // 蓝牙设备枚举放到后台：FindAllAsync 会阻塞 200~800ms，在 UI 线程会卡顿
+    std::mutex btScanMtx_;
+    std::vector<SinkDevice> btScanResult_;
+    std::atomic<bool> btScanReady_{ false };
+    std::atomic<bool> btScanBusy_{ false };
+    float settingsScroll = 0.f;
+    RECTF settingsBody{};
+    HBITMAP oldBmp = nullptr;
+    float settingsContentH = 0.f;   // 上一帧内容总高，用于提前夹紧滚动
+};
 
-    // 设备的音量/静音键。
-    // **必须用 identity（ro.serialno）**，不能用 serial：
-    // 同一台手机可能以 ip:5555、随机端口、或 mDNS 名字三种 serial 出现，
-    // 用 serial 做键会变成三条互不相干的记录，换条链路音量就不跟着走。
-    static std::wstring AdbVolKey(const AdbDevice& d)
-    {
-        return L"adb:" + Utf8ToWide(d.identity.empty() ? d.serial : d.identity);
-    }
-
-    // 蓝牙的音量/静音键：MAC 优先。
-    // 用名字做键的话，设备一改名，之前调好的音量就“丢了”（其实还在，只是对不上）。
-    static std::wstring BtVolKey(const std::wstring& name, const std::string& mac)
-    {
-        return mac.empty() ? (L"bt:" + name) : (L"bt:" + Utf8ToWide(mac));
-    }
-
+// 四个基类只放状态：不加方法、不加构造函数。
+// 这样多继承只影响成员布局，不会引入初始化顺序问题；跨组方法留在 App。
+struct App : ConfigState, DeviceState, AudioState, UiState
+{
+    BtLink bt;
+    OutputAudio oa;
+    AdbChannel adb;
     // 当前左侧选中的设备 key
     std::wstring SelectedKey() const
     {
@@ -205,7 +325,6 @@ struct App
         }
         return BtVolKey(r.name, r.btMac);
     }
-
     // 画面签名：内容没变就不重绘（原来每 250ms 无条件全量重绘）
     size_t VisualSig()
     {
@@ -235,10 +354,6 @@ struct App
         mix((long long)outs.size()); mix((long long)prio.size());
         return h;
     }
-
-    // 统一的播放/连接状态文本（标题栏与音量卡共用同一套口径）
-    struct StatusInfo { std::wstring text; COLORREF color; bool playing = false; };
-
     StatusInfo MakeStatus()
     {
         StatusInfo r;
@@ -271,7 +386,6 @@ struct App
         else                    { r.text = L"无活动"; r.color = th.TextFaint; }     // 灰点
         return r;
     }
-
     // 选中设备当前是否有可调的音量会话（未转发时为 null）
     DevVolEntry* SelectedEntry()
     {
@@ -279,13 +393,11 @@ struct App
         if (k.empty()) return nullptr;
         return FindDevVol(k);
     }
-
     DevVolEntry* FindDevVol(const std::wstring& key)
     {
         for (auto& e : devVols) if (e.key == key) return &e;
         return nullptr;
     }
-
     // ---- 全局 / 单个 模式的读写 ----
     float ActiveVolValue()
     {
@@ -307,15 +419,6 @@ struct App
         for (auto& e : devVols) if (e.key == k) return e.mute;
         return phoneMute;
     }
-    // 音量一律量化到整百分比：内部还是 0..1 浮点（WASAPI 需要），
-    // 但取值只有 0%、1%、…、100% 这 101 档，不会再出现 0.102499 这种小数。
-    static float QuantizeVol(float v)
-    {
-        if (v < 0.f) v = 0.f;
-        if (v > 1.f) v = 1.f;
-        return (float)((int)(v * 100.f + 0.5f)) / 100.f;
-    }
-
     void SetActiveVol(float v)
     {
         v = QuantizeVol(v);
@@ -329,45 +432,8 @@ struct App
         auto k = SelectedKey();
         if (!k.empty()) devMutePref[k] = m;
     }
-
-    // ---- 运行状态（这些字段原本在音量块之后，重构时被误删，此处补回）----
-    bool useAdb = false;
-    bool themeLight = true;    // 默认浅色
-    // 默认关：连接时自动切系统默认输出。
-    // 之所以默认关：切换是整机生效的（Windows 不支持按程序分设备），
-    // 一旦程序异常退出没还原，用户会「整机没声音且找不到原因」——
-    // 而他会去修电脑，不会想到是这个软件。要自动切的人自己勾。
-    bool fixedMode = false;
-    // adbHint 会被工作线程（Post 的 lambda）写、UI 线程读，std::wstring 不能裸并发
-    std::wstring adbHint;
-    mutable std::mutex hintMtx_;
     void SetAdbHint(const std::wstring& h) { std::lock_guard<std::mutex> lk(hintMtx_); adbHint = h; }
     std::wstring GetAdbHint() const { std::lock_guard<std::mutex> lk(hintMtx_); return adbHint; }
-
-    std::wstring currentDefaultId, currentDefaultName;
-    bool routed = false;
-    std::wstring routedPrev;
-    // 崩溃后还原默认输出用：routeDirty = 当前处于「我们把默认设备切走了、还没还原」。
-    // 只靠这两个条件还原：① 上次脏退出 ② 当前默认 == routeTarget。
-    std::wstring routeTarget;
-    std::wstring routePrev;
-    bool routeDirty = false;
-
-    std::vector<Hit> hits;
-    int hover = ID_NONE, hoverIdx = -1;
-    int pressed = ID_NONE, pressedIdx = -1;
-    int scrollDev = 0, scrollPrio = 0;
-
-    bool dragSlider = false;
-
-    bool settingsOpen = false;
-    bool helpOpen = false;
-    int helpTopic = HELP_CHANNEL;
-    float helpScroll = 0.f;
-
-    NOTIFYICONDATAW nid{};
-    bool trayAdded = false;
-
     // 把音量/静音应用到所有手机会话（全局模式）
     void ApplyVolumeAll(float v)
     {
@@ -379,15 +445,6 @@ struct App
         for (auto& ps : phoneSessions)
             if (ps.found) oa.SetSessionMute(ps.instanceId, m);
     }
-
-    // ADB 设备身份 -> 蓝牙名（同一台设备用蓝牙名显示）
-    std::map<std::wstring, std::wstring> btNames;   // identity → 蓝牙名
-    std::map<std::wstring, std::wstring> btMacs;    // identity → 蓝牙 MAC（用于并入总设备列表）
-    // 「删除」过的设备（存 MAC，没有 MAC 时存 identity）。
-    // 作用：只在 ADB 出现过的设备，删掉后不会被每 4 秒的同步重新学回来。
-    // 用户在 ADB 页重新勾选、或点 ↑ADB 时解除。
-    std::set<std::string> btDeleted;
-
     std::wstring NameForIdentity(const std::string& identity) const
     {
         if (identity.empty()) return {};
@@ -417,7 +474,6 @@ struct App
         }
         return changed;
     }
-
     bool RememberBtName(const std::string& identity, const std::wstring& name)
     {
         if (identity.empty() || name.empty()) return false;
@@ -426,26 +482,6 @@ struct App
         slot = name;
         return true;
     }
-    int adbTick = 0;           // 节流：每 N 次 tick 探测一次
-    int adoptTick = 0;         // 节流：接管外部 scrcpy 的检查频率
-    volatile LONG phonePlaying = 0; // 手机端是否真有音频在播（后台线程写，UI 读）
-    int btScanTick = 0;        // 蓝牙列表刷新节流（16*250ms = 4s）
-
-    std::wstring settingsPath;
-    std::wstring lastDeviceId, lastDeviceName;
-    bool autoStart = false, autoConnect = true;
-    bool silentStart = true;   // 开机自启后是否静默进托盘
-    bool idleReset = true;     // 缓冲变更/重建是否只在空闲（没在播放）时做
-    bool autoUpgrade = true;   // 蓝牙连上后是否自动升级到 ADB 音频（手动按钮不受此开关影响）
-    bool autoReconnect = true; // 运行期间设备掉线是否自动连回来（关掉 = 开关 WiFi 即断开）
-    bool showWizard = false;   // 首次设置向导
-    bool setupDone = false;    // 是否已完成过首次设置
-    // 工作线程不能直接操作 BtLink（WinRT 对象是 STA 亲和的，跨线程会崩）。
-    // 这里只置请求，真正的断开在 UI 线程的定时器里做。
-    std::atomic<bool> btDisconnectRequest{ false };
-    std::set<std::string> userStopped;   // 用户手动点了 ■ 的设备，不再自动启动
-    std::set<std::string> autoDevices;   // 勾选「自动连接」的设备（存 identity，IP 变化不影响）
-
     // SetNotice 会被工作线程调用（Post 的 lambda 里），UI 线程每 250ms 读。
     // std::wstring 不能裸并发（赋值/读取并发是未定义行为，可能堆损坏），所以加锁。
     void SetNotice(const std::wstring& t, int level, DWORD ms = 8000)
@@ -460,40 +496,12 @@ struct App
     }
     int GetNoticeLevel() const { std::lock_guard<std::mutex> lk(noticeMtx_); return noticeLevel; }
     ULONGLONG GetNoticeUntil() const { std::lock_guard<std::mutex> lk(noticeMtx_); return noticeUntil; }
-
-    // 顶部提示条（把关键问题从「淡灰小字」变成「醒目横幅」）
-    mutable std::mutex noticeMtx_;
-    std::wstring noticeText;
-    int  noticeLevel = 0;          // 0=信息(蓝) 1=警告(黄) 2=错误(红)
-    ULONGLONG noticeUntil = 0;     // 临时提示的过期时间（用 64 位，避免 49.7 天回绕后提示条永久卡住）
-
     // 这台设备是否被勾选（优先按 identity，兼容旧版本按 serial 记录）
     bool IsAutoDevice(const RowItem& it) const
     {
         if (!it.identity.empty() && autoDevices.count(it.identity)) return true;
         return autoDevices.count(it.serial) > 0;   // 旧数据兼容
     }
-
-    // 蓝牙设备枚举放到后台：FindAllAsync 会阻塞 200~800ms，在 UI 线程会卡顿
-    std::mutex btScanMtx_;
-    std::vector<SinkDevice> btScanResult_;
-    std::atomic<bool> btScanReady_{ false };
-    std::atomic<bool> btScanBusy_{ false };
-    float settingsScroll = 0.f;
-    RECTF settingsBody{};
-    HBITMAP oldBmp = nullptr;
-
-    // 静音自愈：{serial → {本次会话启动时刻, 是否已尝试过, 是否曾出过声}}
-    struct HealState
-    {
-        DWORD spawnMs = 0;
-        DWORD silentSince = 0;    // 从什么时候开始完全没声音（0 = 有声音）
-        DWORD lastNudge = 0;      // 上次自愈时刻（限流）
-        bool  diagDone = false;   // 本轮静音是否已经记过现场
-    };
-    std::map<std::string, HealState> healState;
-    float settingsContentH = 0.f;   // 上一帧内容总高，用于提前夹紧滚动
-    std::wstring closeAction = L"tray", minAction = L"taskbar";   // 最小化默认回任务栏（不是收托盘）
 };
 // 故意不析构：App 含 COM/GDI 相关成员，若在 CoUninitialize 之后析构会崩溃
 static App& g = *new App();
@@ -526,7 +534,7 @@ static std::vector<RowItem> CurrentRows()
             r.running = ::g.adb.UiIsRunning(d.serial);
             // 手机端是否在出声：取该设备音频会话的峰值表结果
             for (auto& e : ::g.devVols)
-                if (e.key == App::AdbVolKey(d)) { r.devPlaying = e.playing; break; }
+                if (e.key == AdbVolKey(d)) { r.devPlaying = e.playing; break; }
             // 无线要区分「已配对」和「老的 tcpip 5555」：
             // 前者手机重启也不掉，后者重启后必须再插一次线。以前两者长得一样，用户没法判断。
             r.sub = d.isWired ? L"USB"
@@ -595,7 +603,7 @@ static std::vector<RowItem> CurrentRows()
                 {
                     // 音频是否真走蓝牙：看这条链路的音频会话有没有峰值
                     for (auto& e : ::g.devVols)
-                        if (e.key == App::BtVolKey(d.name, d.mac)) { r.btAudio = e.playing; break; }
+                        if (e.key == BtVolKey(d.name, d.mac)) { r.btAudio = e.playing; break; }
                 }
             }
             out.push_back(r);
@@ -770,36 +778,6 @@ static void TextWrap(Graphics& g, const std::wstring& s, float x, float y, float
     SolidBrush br(C(c));
     StringFormat sf;
     g.DrawString(s.c_str(), (INT)s.size(), &f, RectF(x, y, w, h), &sf, &br);
-}
-
-// 逐段测量换行后的总高度：与 DrawString 的换行行为一致
-static float MeasureWrapped(Graphics& g, const std::wstring& s, float w, float px)
-{
-    Font& f = GetFont(px, false);
-    StringFormat sf;
-    float total = 0.f;
-    size_t start = 0;
-    while (start <= s.size())
-    {
-        size_t nl = s.find(L'\n', start);
-        std::wstring line = s.substr(start, (nl == std::wstring::npos) ? std::wstring::npos : nl - start);
-        if (line.empty())
-        {
-            RectF probe;
-            g.MeasureString(L" ", 1, &f, PointF(0, 0), &sf, &probe);
-            total += probe.Height;
-        }
-        else
-        {
-            RectF box;
-            // 必须用 RectF 重载：SizeF 重载不做自动换行，会严重低估高度
-            g.MeasureString(line.c_str(), (INT)line.size(), &f, RectF(0, 0, w, 6000.f), &sf, &box);
-            total += box.Height;
-        }
-        if (nl == std::wstring::npos) break;
-        start = nl + 1;
-    }
-    return total;
 }
 
 static float TextWidth(Graphics& g, const std::wstring& s, float px, bool /*bold*/ = false)
@@ -1125,7 +1103,7 @@ static void LoadSettings()
         std::string raw = JNumRaw(j, "PhoneVolume");
         double v = JNum(j, "PhoneVolume", 50.0);
         if (raw.find('.') != std::string::npos) v *= 100.0;    // 老数据：分数 → 百分比
-        ::g.phoneVol = App::QuantizeVol((float)(v / 100.0));
+        ::g.phoneVol = QuantizeVol((float)(v / 100.0));
     }
     ::g.phoneMute = JBool(j, "PhoneMuted", false);
     ::g.lastDeviceId = JStr(j, "LastDeviceId");
@@ -1148,15 +1126,15 @@ static void LoadSettings()
                 if (v.find('.') != std::string::npos) x *= 100.0;   // 老数据：分数 → 百分比
                 // 手改 / 旧版本 / 读到半截数字都可能出现超界值，钳住再存，
                 // 否则 QuantizeVol 会把 0.0 当合法值悄悄吃掉（音量变 0，用户以为坏了）。
-                ::g.devVolPref[Utf8ToWide(k)] = App::QuantizeVol((float)(ClampPercent(x) / 100.0));
+                ::g.devVolPref[Utf8ToWide(k)] = QuantizeVol((float)(ClampPercent(x) / 100.0));
             }
         });
         ForEachPair(JObjBody(j, "DevMute"), [](const std::string& k, const std::string& v) {
             if (k.empty()) return;
             ::g.devMutePref[Utf8ToWide(k)] = (v == "true");
         });
-        // 清掉永远不可能再匹配上的旧键：随机端口 / mDNS 名字形式。
-        // 这些是以前用 serial 当键留下的，同一台设备会占好几条。
+        // 旧的 serial 键先摘出来：随机端口 / mDNS 名字形式，换条链路就匹配不上。
+        // 不直接丢弃 —— 等设备上线、拿到 identity 后再迁过去（见 identGate 那段）。
         {
             // 新格式的键是 adb:<ro.serialno>，里面不可能有冒号。
             // 带冒号的就是旧的「按 serial 记」的键（ip:5555 / ip:随机端口 / mDNS 名字），
@@ -1167,12 +1145,19 @@ static void LoadSettings()
                 return v.find(L':') != std::wstring::npos;
             };
             size_t before = ::g.devVolPref.size() + ::g.devMutePref.size();
-            for (auto it = ::g.devVolPref.begin(); it != ::g.devVolPref.end();)
-                it = stale(it->first) ? ::g.devVolPref.erase(it) : std::next(it);
-            for (auto it = ::g.devMutePref.begin(); it != ::g.devMutePref.end();)
-                it = stale(it->first) ? ::g.devMutePref.erase(it) : std::next(it);
+            auto moveStale = [&stale](auto& m, auto& legacy)
+            {
+                for (auto it = m.begin(); it != m.end();)
+                {
+                    if (!stale(it->first)) { ++it; continue; }
+                    legacy[it->first] = it->second;
+                    it = m.erase(it);
+                }
+            };
+            moveStale(::g.devVolPref, ::g.legacyVol);
+            moveStale(::g.devMutePref, ::g.legacyMute);
             size_t after = ::g.devVolPref.size() + ::g.devMutePref.size();
-            if (after != before) PerfLog("SETTINGS 清理 DevVol/DevMute 旧键：%zu → %zu", before, after);
+            if (after != before) PerfLog("SETTINGS 旧键待迁移（设备上线时生效）：%zu → %zu", before, after);
         }
 
         ForEachPair(JObjBody(j, "BtHistory"), [](const std::string& k, const std::string& v) {
@@ -1225,6 +1210,8 @@ static void LoadSettings()
     ::g.autoUpgrade = JBool(j, "AutoUpgrade", true);
     ::g.autoReconnect = JBool(j, "AutoReconnect", true);
     ::g.adb.SetAutoReconnect(::g.autoReconnect);
+    ::g.autoArmWireless = JBool(j, "AutoArmWireless", true);
+    ::g.adb.SetAutoArmWireless(::g.autoArmWireless);
     ::g.adb.SetDualChannel(JBool(j, "DualChannel", false));
     ::g.adb.SetAutoDual(JBool(j, "AutoDual", false));
     ::g.setupDone = JBool(j, "SetupDone", false);
@@ -1268,7 +1255,7 @@ static void LoadSettings()
         std::map<std::string, int> bp;
         ForEachPair(JObjBody(j, "BufPref"), [&bp](const std::string& k, const std::string& v) {
             // BufPref 是「每台设备学到的缓冲毫秒数」，不是挡位！
-            // （挡位是另一个字段 BufGear，见上面 1232 行，那里才是 0..3）
+            // （挡位是另一个字段 BufGear，见上面 applyBufGear 附近，那里才是 0..3）
             // 这里只防越界/脏值：过小的缓冲会导致持续欠载，过大则延迟失控。
             if (k.empty() || v.empty()) return;
             bp[k] = ClampBufferMs(atoi(v.c_str()));
@@ -2002,10 +1989,13 @@ static void DrawWizard(Graphics& g, int w, int h)
                  anyUnauth ? L"检测到设备，请在屏幕上点「允许 USB 调试」"
                            : L"插线后设备会弹出授权提示，勾选「始终允许」再点确定。",
                  anyUnauth ? 1 : (anyAuthorized ? 2 : 0) };
-    steps[2] = { L"3. 完成（已自动开启无线调试）",
+    steps[2] = { ::g.autoArmWireless ? L"3. 完成（已自动开启无线调试）"
+                                     : L"3. 完成（自动开无线 ADB 已关闭）",
                  adbOk ? L"正在用 ADB 转发音频，可以拔掉 USB 线了。"
                : anyWireless ? L"无线调试已开启。勾选设备列表里的设备即可开始转发。"
-               : L"授权后程序会自动开启无线 ADB，之后不再需要插线。",
+               : (::g.autoArmWireless
+                    ? L"授权后程序会自动开启无线 ADB，之后不再需要插线。"
+                    : L"不会自动开 5555 端口；可在设置里打开，或手动「无线调试配对…」。"),
                  (adbOk || anyWireless) ? 2 : 0 };
 
     float py = card.Y + S(62);
@@ -2346,6 +2336,16 @@ static void DrawSettings(Graphics& g, int w, int h)
     TextWrap(g, L"关闭后：掉线就停在那儿，不再重连、也不再自动恢复"
                 L"（启动后约两分钟内仍会照常连上）。"
                 L"想停就关一下手机 WiFi；想用就打开 WiFi、点「刷新」。",
+             px + S(24), py, pw - S(24), S(46), S(11.5f), ::g.th.TextMuted);
+    row(S(48));
+
+    // ---- 自动开无线 ADB ----
+    DrawCheck(g, px, py, ::g.autoArmWireless, S(16));
+    Text(g, L"自动开启无线 ADB（adb tcpip 5555）", px + S(24), py, S(13.5f), ::g.th.Text);
+    pushHit({ ID_SET_AUTOARM, -1, RECTF(px - S(4), py - S(5), pw, S(25)) });
+    row(S(22));
+    TextWrap(g, L"插 USB 时会执行 adb tcpip 5555，把手机的 5555 端口开到当前网络；"
+                L"只在可信网络使用。关闭后不再自动开端口，仍可手动「无线调试配对…」。",
              px + S(24), py, pw - S(24), S(46), S(11.5f), ::g.th.TextMuted);
     row(S(48));
 
@@ -3090,13 +3090,28 @@ static void RenderTo(HDC target, int w, int h)
 
     if (!::g.memDC || g.memW != w || g.memH != h)
     {
-        if (::g.memBmp) { SelectObject(::g.memDC, ::g.oldBmp); DeleteObject(::g.memBmp); ::g.memBmp = nullptr; }
-        if (::g.memDC) DeleteDC(::g.memDC);
+        static ULONGLONG retryAt = 0;
+        if (GetTickCount64() < retryAt) return;
+        if (::g.memBmp)
+        {
+            if (::g.memDC) SelectObject(::g.memDC, ::g.oldBmp);
+            DeleteObject(::g.memBmp);
+            ::g.memBmp = nullptr;
+        }
+        if (::g.memDC) { DeleteDC(::g.memDC); ::g.memDC = nullptr; }
         HDC screen = GetDC(hwnd);
+        if (!screen) return;
         ::g.memDC = CreateCompatibleDC(screen);
-        ::g.memBmp = CreateCompatibleBitmap(screen, w, h);
-        ::g.oldBmp = (HBITMAP)SelectObject(::g.memDC, ::g.memBmp);
+        ::g.memBmp = ::g.memDC ? CreateCompatibleBitmap(screen, w, h) : nullptr;
         ReleaseDC(hwnd, screen);
+        if (!::g.memDC || !::g.memBmp)
+        {
+            if (::g.memBmp) { DeleteObject(::g.memBmp); ::g.memBmp = nullptr; }
+            if (::g.memDC) { DeleteDC(::g.memDC); ::g.memDC = nullptr; }
+            retryAt = GetTickCount64() + 2000;   // 创建失败时退避，避免每次重绘都重试
+            return;
+        }
+        ::g.oldBmp = (HBITMAP)SelectObject(::g.memDC, ::g.memBmp);
         g.memW = w;
         g.memH = h;
     }
@@ -3184,13 +3199,28 @@ static void PaintCheck(HWND hwnd)
     static int     mw = 0, mh = 0;
     if (!memDC || mw != w || mh != h)
     {
-        if (memBmp) { SelectObject(memDC, oldBmp); DeleteObject(memBmp); memBmp = nullptr; }
-        if (memDC) DeleteDC(memDC);
+        static ULONGLONG retryAt = 0;
+        if (GetTickCount64() < retryAt) return;
+        if (memBmp)
+        {
+            if (memDC) SelectObject(memDC, oldBmp);
+            DeleteObject(memBmp);
+            memBmp = nullptr;
+        }
+        if (memDC) { DeleteDC(memDC); memDC = nullptr; }
         HDC screen = GetDC(hwnd);
+        if (!screen) return;
         memDC = CreateCompatibleDC(screen);
-        memBmp = CreateCompatibleBitmap(screen, w, h);
-        oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
+        memBmp = memDC ? CreateCompatibleBitmap(screen, w, h) : nullptr;
         ReleaseDC(hwnd, screen);
+        if (!memDC || !memBmp)
+        {
+            if (memBmp) { DeleteObject(memBmp); memBmp = nullptr; }
+            if (memDC) { DeleteDC(memDC); memDC = nullptr; }
+            retryAt = GetTickCount64() + 2000;
+            return;
+        }
+        oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
         mw = w; mh = h;
     }
 
@@ -3438,23 +3468,11 @@ static void PollBtScan()
         // 老数据迁移：音量/静音以前按蓝牙名记，改成按 MAC（改名不丢）。只需做一次。
         {
             std::wstring oldKey = L"bt:" + d.name;
-            std::wstring newKey = App::BtVolKey(d.name, d.mac);
+            std::wstring newKey = BtVolKey(d.name, d.mac);
             if (oldKey != newKey)
             {
-                auto itv = ::g.devVolPref.find(oldKey);
-                if (itv != ::g.devVolPref.end())
-                {
-                    if (!::g.devVolPref.count(newKey)) ::g.devVolPref[newKey] = itv->second;
-                    ::g.devVolPref.erase(itv);
-                    ::g.btHistoryDirty = true;
-                }
-                auto itm = ::g.devMutePref.find(oldKey);
-                if (itm != ::g.devMutePref.end())
-                {
-                    if (!::g.devMutePref.count(newKey)) ::g.devMutePref[newKey] = itm->second;
-                    ::g.devMutePref.erase(itm);
-                    ::g.btHistoryDirty = true;
-                }
+                if (MoveKey(::g.devVolPref, oldKey, newKey)) ::g.btHistoryDirty = true;
+                if (MoveKey(::g.devMutePref, oldKey, newKey)) ::g.btHistoryDirty = true;
             }
         }
     }
@@ -3799,25 +3817,7 @@ static void ConnectSelected()
     ::g.bt.Connect(r.btId, r.name);
 }
 
-static void ApplyAutoStart()
-{
-    HKEY k = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-                      0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) return;
-    if (::g.autoStart)
-    {
-        wchar_t exe[MAX_PATH];
-        GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        std::wstring cmd = std::wstring(L"\"") + exe + L"\"" + (::g.silentStart ? L" --tray" : L"");
-        RegSetValueExW(k, L"WaveTether", 0, REG_SZ, (const BYTE*)cmd.c_str(),
-                       (DWORD)((cmd.size() + 1) * sizeof(wchar_t)));
-    }
-    else
-    {
-        RegDeleteValueW(k, L"WaveTether");
-    }
-    RegCloseKey(k);
-}
+#include "autostart.inc"
 
 static HICON MakeTrayIcon(bool connected)
 {
@@ -4138,6 +4138,11 @@ static void ExportLogsAndOpen()
     ::g.SetNotice(L"已导出脱敏日志，把这个文件夹发给我就行", 0, 9000);
 }
 
+static void NotifyQueueBusy()
+{
+    ::g.SetNotice(L"后台任务队列已满，操作没有执行；请稍后重试", 1);
+}
+
 static void DoClick(int id, int idx)
 {
     PerfScope psClick("DoClick", 3.0, id);
@@ -4170,14 +4175,14 @@ static void DoClick(int id, int idx)
         }
         if (LinkUp())
         {
-            ::g.adb.Post([]{ ::g.adb.Stop(); });
+            if (!::g.adb.PostCritical([]{ ::g.adb.Stop(); })) NotifyQueueBusy();
         }
         else
         {
             // ADB：一次启动「所有」已授权设备 → 多设备同时播放
             // 探测和启动都是阻塞 IO，交给工作线程
             ::g.SetAdbHint(L"正在启动…");
-            ::g.adb.Post([]{
+            if (!::g.adb.PostCritical([]{
                 ::g.adb.Probe();
                 int started = 0;
                 // 注意：这里必须用真实列表 Devices()，不能用 UiDevices()——
@@ -4190,7 +4195,11 @@ static void DoClick(int id, int idx)
                 ::g.SetAdbHint((started == 0) ? std::wstring(L"未找到可启动的设备")
                             : (started == 1) ? std::wstring(L"ADB 音频转发中")
                                              : std::wstring(L"ADB 多设备同时转发中"));
-            });
+            }))
+            {
+                ::g.SetAdbHint(L"启动失败：后台队列已满");
+                NotifyQueueBusy();
+            }
         }
         break;
     case ID_PAIR_OPEN:
@@ -4280,7 +4289,7 @@ static void DoClick(int id, int idx)
         }
         break;
     case ID_BTN_REFRESH:
-        if (::g.useAdb) ::g.adb.Post([]{ ::g.adb.Probe(); });
+        if (::g.useAdb) ::g.adb.PostProbe([]{ ::g.adb.Probe(); });
         else RefreshDevices();
         break;
     case ID_TAB_BT:
@@ -4339,14 +4348,24 @@ static void DoClick(int id, int idx)
             if (::g.adb.UiIsRunning(ser))
             {
                 ::g.userStopped.insert(ser);          // 用户主动停的，别再自动拉起
-                ::g.adb.Post([ser]{ ::g.adb.StopDevice(ser); });
-                ::g.SetAdbHint(L"已停止该设备");
+                if (::g.adb.PostCritical([ser]{ ::g.adb.StopDevice(ser); }))
+                    ::g.SetAdbHint(L"已停止该设备");
+                else
+                {
+                    ::g.SetAdbHint(L"停止失败：后台队列已满");
+                    NotifyQueueBusy();
+                }
             }
             else
             {
                 ::g.userStopped.erase(ser);
-                ::g.adb.Post([ser]{ ::g.adb.StartDevice(ser); ::g.adb.Probe(); });
-                ::g.SetAdbHint(L"已开始转发");
+                if (::g.adb.PostCritical([ser]{ ::g.adb.StartDevice(ser); ::g.adb.Probe(); }))
+                    ::g.SetAdbHint(L"已开始转发");
+                else
+                {
+                    ::g.SetAdbHint(L"启动失败：后台队列已满");
+                    NotifyQueueBusy();
+                }
             }
         }
         break;
@@ -4375,7 +4394,7 @@ static void DoClick(int id, int idx)
             for (int i = 0; i < (int)rows.size(); i++)
             {
                 std::wstring key = ::g.useAdb ? (L"adb:" + Utf8ToWide(rows[i].serial))
-                                              : App::BtVolKey(rows[i].name, rows[i].btMac);
+                                              : BtVolKey(rows[i].name, rows[i].btMac);
                 if (::g.FindDevVol(key))
                 {
                     if (::g.useAdb) ::g.adbSel = i; else ::g.btSel = i;
@@ -4431,9 +4450,14 @@ static void DoClick(int id, int idx)
         //
         // 「自动重连」关掉后，这里就是「重新连上」的唯一入口：
         // 立刻试一次已知无线地址（不等后台轮询、不受启动窗口限制）。
-        ::g.adb.Post([]{ ::g.adb.Probe(); ::g.adb.ReconnectKnownWireless(true); });
+        if (::g.adb.PostCritical([]{ ::g.adb.Probe(); ::g.adb.ReconnectKnownWireless(true); }))
+            ::g.SetAdbHint(L"已刷新");
+        else
+        {
+            ::g.SetAdbHint(L"刷新失败：后台队列已满");
+            NotifyQueueBusy();
+        }
         RefreshDevices();
-        ::g.SetAdbHint(L"已刷新");
         break;
     }
     case ID_CHECK:
@@ -4500,9 +4524,13 @@ static void DoClick(int id, int idx)
         // 直接在 UI 线程调会把窗口冻住。
         {
             bool on = !::g.adb.DualChannel();
-            ::g.adb.Post([on]{ ::g.adb.SetDualChannel(on); });
+            // 先改标志再存盘：SaveSettings 读的是这个值，晚一步就会把旧值写回去，
+            // 重启后开关又变回原样。标志是原子的，UI 线程改它不用等锁。
+            ::g.adb.SetDualChannelWant(on);
+            SaveSettings();
+            if (!::g.adb.PostCritical([on]{ ::g.adb.SetDualChannel(on); }))   // 工作线程做备用通道清理
+                NotifyQueueBusy();
         }
-        SaveSettings();
         break;
     case ID_WIZ_CLOSE:
         ::g.showWizard = false;
@@ -4538,10 +4566,16 @@ static void DoClick(int id, int idx)
             SaveSettings();
             // 换挡要让新缓冲生效，但必须走「延迟重启」：
             // 立刻重启会导致设备端还没释放音频输入，新会话抢不到声音。
-            ::g.adb.Post([]{ ::g.adb.ApplyGearToRunning(); });
+            if (!::g.adb.PostCritical([]{ ::g.adb.ApplyGearToRunning(); }))
+                NotifyQueueBusy();
         }
         break;
     }
+    case ID_SET_AUTOARM:
+        ::g.autoArmWireless = !::g.autoArmWireless;
+        ::g.adb.SetAutoArmWireless(::g.autoArmWireless);
+        SaveSettings();
+        break;
     case ID_SET_AUTOADAPT:
         ::g.adb.SetAutoAdapt(!::g.adb.AutoAdapt());
         SaveSettings();
@@ -4594,858 +4628,25 @@ static void TogglePrioCheck(int idx)
 
 // ------------------------------------------------------------------ 消息
 
+#include "ui_tick.inc"
+
 // 真正的消息处理。外面包一层 WndProc 做异常边界，见下。
+#include "ui_input.inc"
+#include "ui_chrome.inc"
 static LRESULT CALLBACK WndProcInner(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg)
     {
-    case WM_GETMINMAXINFO:
-    {
-        // 布局是按 960x556 设计的，再小控件会互相压住
-        auto* mmi = (MINMAXINFO*)lp;
-        mmi->ptMinTrackSize.x = (LONG)(760 * ::g.dpi);
-        mmi->ptMinTrackSize.y = (LONG)(500 * ::g.dpi);
-        return 0;
-    }
-    case WM_NCCALCSIZE:
-        if (wp) return 0;
-        break;
-
-    case WM_NCHITTEST:
-    {
-        POINT p{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        ScreenToClient(hwnd, &p);
-        RECT rc; GetClientRect(hwnd, &rc);
-        int b = (int)S(6);
-        if (p.y < b) return HTTOP;
-        if (p.y > rc.bottom - b) return HTBOTTOM;
-        if (p.x < b) return HTLEFT;
-        if (p.x > rc.right - b) return HTRIGHT;
-
-        // 标题栏右侧三个按钮：必须让点击落到客户端，否则会被当成拖拽
-        if (p.y < (int)S(44))
-        {
-            float bw = S(40), gap = S(4), by = S(8);
-            float right = (float)rc.right - S(10);
-            for (int i = 0; i < 3; i++)
-            {
-                float x0 = right - bw * (i + 1) - gap * i;
-                if (p.x >= x0 && p.x <= x0 + bw && p.y >= by && p.y <= by + S(28))
-                    return HTCLIENT;
-            }
-            // 提示条里的动作按钮（如「自检」）也在这个高度上，
-            // 不放行的话真鼠标点它只会拖动窗口（PostMessage 能点，真鼠标不能 —— 很难发现）
-            if (::g.noticeBtnRect.Width > 0 &&
-                p.x >= ::g.noticeBtnRect.X && p.x <= ::g.noticeBtnRect.GetRight() &&
-                p.y >= ::g.noticeBtnRect.Y && p.y <= ::g.noticeBtnRect.GetBottom())
-                return HTCLIENT;
-            return HTCAPTION;
-        }
-        return HTCLIENT;
-    }
-
-    case WM_ERASEBKGND: return 1;
-
-    case WM_PAINT: Paint(hwnd); return 0;
-
-    case WM_PRINTCLIENT:
-    {
-        RECT rc;
-        GetClientRect(hwnd, &rc);
-        RenderTo((HDC)wp, rc.right, rc.bottom);
-        return 0;
-    }
-
-    case WM_SIZE:
-        InvalidateRect(hwnd, nullptr, FALSE);
-        return 0;
-
-    case WM_DPICHANGED:
-    {
-        ::g.dpi = (float)HIWORD(wp) / 96.f;
-        RECT* r = (RECT*)lp;
-        SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
-        InvalidateRect(hwnd, nullptr, FALSE);
-        return 0;
-    }
-
-    case WM_MOUSEMOVE:
-    {
-        POINT p{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        if (::g.dragSlider)
-        {
-            for (auto& h : ::g.hits)
-                if (h.id == ID_SLIDER)
-                {
-                    float t = (p.x - h.r.X) / h.r.Width;
-                    t = std::clamp(t, 0.f, 1.f);
-                    ::g.SetActiveVol(t);
-                    if (::g.volMode == 0) ::g.ApplyVolumeAll(t);
-                    else
-                    {
-                        auto k = ::g.SelectedKey();
-                        for (auto& e : ::g.devVols)
-                            if (e.key == k) { ::g.oa.SetSessionVolume(e.instanceId, t); break; }
-                    }
-                }
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return 0;
-        }
-
-        int oldHover = ::g.hover, oldIdx = ::g.hoverIdx;
-        ::g.hover = ID_NONE; ::g.hoverIdx = -1;
-        for (auto it = ::g.hits.rbegin(); it != ::g.hits.rend(); ++it)
-        {
-            if (it->r.Contains((float)p.x, (float)p.y))
-            {
-                ::g.hover = it->id; ::g.hoverIdx = it->index;
-                break;
-            }
-        }
-        if (oldHover != ::g.hover || oldIdx != ::g.hoverIdx) InvalidateRect(hwnd, nullptr, FALSE);
-
-        TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, hwnd, 0 };
-        TrackMouseEvent(&tme);
-        return 0;
-    }
-
-    case WM_MOUSELEAVE:
-        ::g.hover = ID_NONE; ::g.hoverIdx = -1;
-        InvalidateRect(hwnd, nullptr, FALSE);
-        return 0;
-
-    case WM_NCACTIVATE:
-        // 不让系统重画非客户区：否则失焦时 DWM 会给这个 popup 描一圈边框
-        return TRUE;
-
-    case WM_ACTIVATE:
-        if (LOWORD(wp) != WA_INACTIVE)
-        {
-            ShowWindow(hwnd, SW_SHOW);
-            SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-            InvalidateRect(hwnd, nullptr, FALSE);
-        }
-        return 0;
-
-    case WM_MOUSEACTIVATE:
-        // 正常激活：点击窗口即置顶并获得焦点
-        return MA_ACTIVATE;
-
-    case WM_LBUTTONDOWN:
-    {
-        SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-        POINT p{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        for (auto it = ::g.hits.rbegin(); it != ::g.hits.rend(); ++it)
-        {
-            if (!it->r.Contains((float)p.x, (float)p.y)) continue;
-            ::g.pressed = it->id; ::g.pressedIdx = it->index;
-            if (it->id == ID_SLIDER)
-            {
-                // 点一下就跳到该位置：原来只在 WM_MOUSEMOVE 里生效，
-                // 单击滑块不会改变数值，用户会以为滑块坏了。
-                ::g.dragSlider = true;
-                SetCapture(hwnd);
-                float t = (p.x - it->r.X) / it->r.Width;
-                t = std::clamp(t, 0.f, 1.f);
-                ::g.SetActiveVol(t);
-                if (::g.volMode == 0) ::g.ApplyVolumeAll(t);
-                else if (auto* e = ::g.SelectedEntry())
-                {
-                    ::g.oa.SetSessionVolume(e->instanceId, t);
-                    e->vol = t;
-                }
-                InvalidateRect(hwnd, nullptr, FALSE);
-            }
-            // 优先级列表：点在复选框列 → 切换勾选；点其它位置 → 手动切换到该设备
-            if (it->id == ID_PRIO_LIST && it->index >= 0)
-            {
-                float cbX = it->r.X + S(24);
-                if (p.x >= cbX - S(8) && p.x <= cbX + S(24)) TogglePrioCheck(it->index);
-                else SwitchOutputTo(it->index);
-            }
-            break;
-        }
-        InvalidateRect(hwnd, nullptr, FALSE);
-        return 0;
-    }
-
-    case WM_LBUTTONUP:
-    {
-        PerfScope psClick("CLICKUP", 1.0, 0);
-        POINT p{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        ::g.perfClickAt = GetTickCount64();
-        if (::g.dragSlider)
-        {
-            ::g.dragSlider = false;
-            ReleaseCapture();
-            SaveSettings();
-        }
-        bool hitAny = false;
-        for (auto it = ::g.hits.rbegin(); it != ::g.hits.rend(); ++it)
-        {
-            if (!it->r.Contains((float)p.x, (float)p.y)) continue;
-            hitAny = true;
-            if (it->id == ::g.pressed && it->index == ::g.pressedIdx)
-                DoClick(it->id, it->index);
-            break;
-        }
-        // 帮助/设置只通过明确的关闭按钮关闭，避免误点面板外时丢失内容
-        ::g.pressed = ID_NONE; ::g.pressedIdx = -1;
-        InvalidateRect(hwnd, nullptr, FALSE);
-        return 0;
-    }
-
-    case WM_MOUSEWHEEL:
-    {
-        POINT p{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        ScreenToClient(hwnd, &p);
-        int delta = GET_WHEEL_DELTA_WPARAM(wp) > 0 ? -1 : 1;
-
-        // 设置面板：主体区域直接滚动（不能被控件命中抢走）
-        if (::g.settingsOpen && ::g.settingsBody.Contains((float)p.x, (float)p.y))
-        {
-            ::g.settingsScroll = std::max(0.f, ::g.settingsScroll + delta * S(36));
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return 0;
-        }
-
-        for (auto& h : ::g.hits)
-        {
-            if (!h.r.Contains((float)p.x, (float)p.y)) continue;
-            if (h.id == ID_BT_LIST) ::g.scrollDev = std::max(0, ::g.scrollDev + delta);
-            if (h.id == ID_PRIO_LIST) ::g.scrollPrio = std::max(0, ::g.scrollPrio + delta);
-            if (h.id == ID_HELP_BODY) ::g.helpScroll = std::max(0.f, ::g.helpScroll + delta * S(36));
-            if (h.id == ID_SET_BODY)  ::g.settingsScroll = std::max(0.f, ::g.settingsScroll + delta * S(36));
-            InvalidateRect(hwnd, nullptr, FALSE);
-            break;
-        }
-        return 0;
-    }
-
+    case WM_GETMINMAXINFO: case WM_NCCALCSIZE: case WM_NCHITTEST: case WM_ERASEBKGND: case WM_PAINT: case WM_PRINTCLIENT: case WM_SIZE: case WM_DPICHANGED: case WM_NCACTIVATE: case WM_ACTIVATE: case WM_MOUSEACTIVATE: case WM_SHOWME:
+        return HandleChrome(hwnd, msg, wp, lp);
+    case WM_MOUSEMOVE: case WM_MOUSELEAVE: case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_MOUSEWHEEL:
+        return HandleMouse(hwnd, msg, wp, lp);
     case WM_TRAY:
-        if (lp == WM_RBUTTONUP || lp == WM_CONTEXTMENU)
-        {
-            HMENU m = CreatePopupMenu();
-            bool connected = LinkUp();
-            AppendMenuW(m, MF_STRING, 1, connected ? L"断开" : L"连接");
-            AppendMenuW(m, MF_STRING, 2, ::g.phoneMute ? L"取消静音" : L"静音");
-            AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(m, MF_STRING, 3, L"显示面板");
-            AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(m, MF_STRING, 4, L"退出");
-            POINT p; GetCursorPos(&p);
-            SetForegroundWindow(hwnd);
-            int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, 0, hwnd, nullptr);
-            DestroyMenu(m);
-            if (cmd == 1) { if (connected) ::g.bt.Disconnect(); else ConnectSelected(); }
-            if (cmd == 2) { ::g.phoneMute = !::g.phoneMute;
-                ::g.ApplyMuteAll(::g.phoneMute);
-                SaveSettings(); }
-            if (cmd == 3) ShowWindowFromTray();
-            if (cmd == 4) DestroyWindow(hwnd);
-            InvalidateRect(hwnd, nullptr, FALSE);
-        }
-        else if (lp == WM_LBUTTONUP || lp == WM_LBUTTONDBLCLK)
-        {
-            ShowWindowFromTray();
-        }
-        return 0;
-
-    case WM_SHOWME:
-        ShowWindowFromTray();
-        return 0;
-
-    case WM_CHAR:
-        if (::g.pairOpen)
-        {
-            wchar_t c = (wchar_t)wp;
-            std::wstring* target = (::g.pairFocus == 0) ? &::g.pairAddr
-                                 : (::g.pairFocus == 1) ? &::g.pairCode : &::g.pairPort;
-            size_t limit = (::g.pairFocus == 0) ? 21 : (::g.pairFocus == 1 ? 6 : 5);
-            bool ok = (c >= L'0' && c <= L'9') || (::g.pairFocus == 0 && (c == L'.' || c == L':'));
-            if (ok && target->size() < limit) *target += c;
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return 0;
-        }
-        break;
-
-    case WM_KEYDOWN:
-        if (::g.pairOpen)
-        {
-            std::wstring* target = (::g.pairFocus == 0) ? &::g.pairAddr
-                                 : (::g.pairFocus == 1) ? &::g.pairCode : &::g.pairPort;
-            size_t limit = (::g.pairFocus == 0) ? 21 : (::g.pairFocus == 1 ? 6 : 5);
-            if (wp == 'V' && (GetKeyState(VK_CONTROL) & 0x8000))
-            {
-                // 粘贴：地址/配对码可能来自别处，能贴就不用打
-                if (OpenClipboard(hwnd))
-                {
-                    if (HANDLE hd = GetClipboardData(CF_UNICODETEXT))
-                    {
-                        if (auto* txt = (const wchar_t*)GlobalLock(hd))
-                        {
-                            for (const wchar_t* q = txt; *q && target->size() < limit; ++q)
-                            {
-                                wchar_t c = *q;
-                                bool ok = (c >= L'0' && c <= L'9') ||
-                                          (::g.pairFocus == 0 && (c == L'.' || c == L':'));
-                                if (ok) *target += c;
-                            }
-                            GlobalUnlock(hd);
-                        }
-                    }
-                    CloseClipboard();
-                }
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
-            }
-            if (wp == VK_BACK) { if (!target->empty()) target->pop_back(); }
-            else if (wp == VK_TAB) { ::g.pairFocus = (::g.pairFocus + 1) % 3; }
-            else if (wp == VK_ESCAPE) { ::g.pairOpen = false; }
-            else if (wp == VK_RETURN)
-            {
-                // 回车 = 直接开始配对
-                if (!::g.pairAddr.empty() && !::g.pairCode.empty())
-                {
-                    std::string a = WideToUtf8(::g.pairAddr);
-                    std::string c = WideToUtf8(::g.pairCode);
-                    std::string p = WideToUtf8(::g.pairPort);
-                    ::g.adb.PairWirelessAsync(a, c, p);
-                    ::g.pairStatusLocal = L"正在配对…";
-                }
-            }
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return 0;
-        }
-        if (wp == VK_ESCAPE)
-        {
-            // Esc 只关浮层，不越权关窗口（否则会绕过「关闭=收进托盘」的设置）
-            if (::g.showWizard)
-            {
-                // 关掉向导 = 用户决定跳过，记下来，否则每次启动都再弹一遍
-                ::g.showWizard = false;
-                ::g.setupDone = true;
-                SaveSettings();
-            }
-            else if (::g.helpOpen) ::g.helpOpen = false;
-            else if (::g.settingsOpen) ::g.settingsOpen = false;
-            InvalidateRect(hwnd, nullptr, FALSE);
-        }
-        return 0;
-
+        return HandleTray(hwnd, msg, wp, lp);
+    case WM_KEYDOWN: case WM_CHAR:
+        return HandleKeys(hwnd, msg, wp, lp);
     case WM_TIMER:
-        if (wp == 1)
-        {
-            ::g.bt.Tick();
-            // Tick / BootstrapTick / ReconnectTick / KnownWirelessTick / AdaptTick
-            // 已全部移到 AdbChannel 的工作线程，避免阻塞 UI
-            {
-                // 学习到的缓冲 / 已知无线设备 变化时才写盘（避免频繁 IO）
-                static std::map<std::string, int> lastBuf;
-                static std::set<std::string> lastKnown;
-                static std::set<std::string> lastWanted;
-                auto cur = ::g.adb.UiBufferPrefs();
-                auto kn = ::g.adb.UiKnownWireless();
-                auto wd = ::g.adb.UiWantedSerials();
-                // 蓝牙历史（改名同步 / 新设备）也在这里落盘，避免每帧写盘
-                bool histDirty = ::g.btHistoryDirty;
-                ::g.btHistoryDirty = false;
-
-                if (cur != lastBuf || kn != lastKnown || wd != lastWanted || histDirty)
-                {
-                    lastBuf = cur;
-                    lastKnown = kn;
-                    lastWanted = wd;
-                    SaveSettings();
-                }
-            }
-
-            // 蓝牙已连接 → 精确匹配对应的 ADB 设备并升级到 ADB 音频
-            // 依据：设备自己的蓝牙名（settings secure bluetooth_name）与蓝牙名一致
-            if (::g.bt.State() == LinkState::Connected && !::g.bt.DeviceName().empty())
-            {
-                if (::g.adb.UiDevices().empty()) ::g.adb.Post([]{ ::g.adb.Probe(); });
-
-                // 记住 identity → 蓝牙名，供 ADB 列表显示
-                for (auto& d : ::g.adb.UiDevices())
-                {
-                    if (d.state != "device" || d.btName.empty()) continue;
-                    std::wstring dn = Utf8ToWide(d.btName);
-                    if (dn == ::g.bt.DeviceName() &&
-                        ::g.RememberAdbDevice(d.identity, ::g.bt.DeviceName(), std::string()))
-                        SaveSettings();
-                }
-
-                // 升级：只对「蓝牙连着的那台」启动 ADB，不再用单一 IP 猜
-                // 升级请求交给工作线程，成功后由 ConsumeUpgraded() 取结果
-                if (!::g.useAdb && ::g.autoUpgrade && ::g.adb.UiRunningCount() == 0)
-                {
-                    static int upgradeTick = 0;
-                    if (++upgradeTick >= 20)   // 5 秒试一次，避免频繁
-                    {
-                        upgradeTick = 0;
-                        ::g.adb.RequestUpgradeForBt(::g.bt.DeviceName());
-                    }
-                }
-                if (::g.adb.ConsumeUpgraded())
-                {
-                    ::g.useAdb = true;
-                    ::g.bt.Disconnect();       // 释放蓝牙，避免两条链路同时出声
-                    ::g.SetNotice(L"已自动升级到 ADB 音频通道", 0, 6000);
-                    SaveSettings();
-                }
-            }
-
-            // 蓝牙模式：周期性刷新设备列表，新配对/移除的设备能自动出现
-            if (!::g.useAdb && ::g.bt.State() != LinkState::Connected && ++::g.btScanTick >= 240)  // 60 秒一次（WinRT 枚举较重）
-            {
-                ::g.btScanTick = 0;
-                RefreshDevices();   // 后台枚举，不阻塞 UI
-            }
-            // 接管外部 scrcpy 不需要 4Hz：只在「自己一个会话都没跑」时才可能用到，
-            // 而 FindExternalScrcpy 是全进程快照（7.8ms/次）。降到约 4 秒一次。
-            if (::g.useAdb && ++::g.adoptTick >= 16)
-            {
-                ::g.adoptTick = 0;
-                ::g.adb.Post([]{ ::g.adb.AdoptExternal(); });
-            }
-            // 手动升级的结果：以前失败了完全没有任何反馈，用户只觉得「点了没反应」
-            {
-                int ur = ::g.adb.UiUpgradeResult();
-                if (ur == 1)
-                {
-                    ::g.adb.ResetUpgradeResult();
-                    ::g.adb.ConsumeUpgraded();
-                    ::g.useAdb = true;
-                    if (::g.pairOpen) ::g.pairStatusLocal = ::g.adb.UiUpgradeStatus();
-                    else ::g.SetNotice(L"已升级到 ADB 音频", 0, 4000);
-                }
-                else if (ur == 2)
-                {
-                    ::g.adb.ResetUpgradeResult();
-                    std::wstring why = ::g.adb.UiUpgradeStatus();
-                    if (why.empty()) why = L"升级失败：没找到这台设备的 ADB 连接。";
-                    if (::g.pairOpen) ::g.pairStatusLocal = why;
-                    else ::g.SetNotice(why, 1, 9000);
-                }
-            }
-
-            // 配对框开着且地址还空着 → 把 mDNS 查到的地址自动填进去
-            if (::g.pairOpen && ::g.pairAddr.empty())
-            {
-                std::wstring ep = ::g.adb.UiPairingEndpoint();
-                if (!ep.empty())
-                {
-                    ::g.pairAddr = ep;
-                    if (::g.pairStatusLocal.find(L"正在查找") != std::wstring::npos)
-                        ::g.pairStatusLocal = L"已自动填入手机广播的配对地址，只需再输 6 位配对码。";
-                }
-                else if (::g.pairStatusLocal.empty())
-                {
-                    // 找不到就直说，否则用户只会看到一个空输入框
-                    ::g.pairStatusLocal = L"没找到手机的配对地址。请确认手机上停在「使用配对码配对设备」界面"
-                                          L"（打开「二维码扫描」那个界面时手机不广播，找不到）。也可以手输。";
-                }
-            }
-
-            // 配对结束后把「正在配对…」换成真实结果（结果文字由工作线程写）
-            if (::g.pairOpen && !::g.adb.UiPairBusy() &&
-                (::g.pairStatusLocal == L"正在配对…" || ::g.pairStatusLocal == L"正在连接…"))
-                ::g.pairStatusLocal.clear();   // 失败时会显示工作线程写的真实原因，按钮回到「重试配对」
-
-            // 每 4 秒把在线 ADB 设备的蓝牙身份（名字+MAC）记进总列表
-            {
-                static int identTick = 0;
-                if (::g.useAdb && ++identTick >= 16)
-                {
-                    identTick = 0;
-                    bool ch = false;
-                    for (auto& d : ::g.adb.UiDevices())
-                    {
-                        if (d.state != "device") continue;
-                        if (::g.RememberAdbDevice(d.identity, Utf8ToWide(d.btName), d.btMac)) ch = true;
-
-                        // 老数据迁移：音量/静音以前按 serial 记，同一台设备会有多条。
-                        // 看到设备在线就顺手并到 identity 键上（只需做一次）。
-                        if (!d.identity.empty() && d.serial != d.identity)
-                        {
-                            std::wstring oldKey = L"adb:" + Utf8ToWide(d.serial);
-                            std::wstring newKey = App::AdbVolKey(d);
-                            auto itv = ::g.devVolPref.find(oldKey);
-                            if (itv != ::g.devVolPref.end())
-                            {
-                                if (!::g.devVolPref.count(newKey)) ::g.devVolPref[newKey] = itv->second;
-                                ::g.devVolPref.erase(itv);
-                                ch = true;
-                            }
-                            auto itm2 = ::g.devMutePref.find(oldKey);
-                            if (itm2 != ::g.devMutePref.end())
-                            {
-                                if (!::g.devMutePref.count(newKey)) ::g.devMutePref[newKey] = itm2->second;
-                                ::g.devMutePref.erase(itm2);
-                                ch = true;
-                            }
-                        }
-                    }
-                    if (ch) ::g.btHistoryDirty = true;   // 复用同一个落盘标志
-                }
-            }
-            if (::g.useAdb && ++::g.adbTick >= 24)   // 约 6 秒探测一次（运行中列表变化少）
-            {
-                ::g.adbTick = 0;
-                ::g.adb.Post([]{ ::g.adb.Probe(); });   // 运行中也要刷新列表（Probe 内部保护运行状态）
-            }
-
-            // 音频会话枚举：每 1 秒一次（原来每 250ms 枚举两遍）
-            static int sessTick = 0;
-            if (++sessTick >= 4)
-            {
-                sessTick = 0;
-                ::g.devVols.clear();
-                for (auto& ss : ::g.oa.AllSessions())
-                {
-                    App::DevVolEntry e;
-                    e.playing = ss.playing;
-                    e.vol = (ss.volume >= 0.f) ? ss.volume : 1.f;
-                    e.mute = ss.muted;
-                    e.instanceId = ss.instanceId;
-
-                    std::string ser = ::g.adb.UiSerialForPid(ss.pid);
-                    if (!ser.empty())
-                    {
-                        e.isBt = false;
-                        for (auto& d : ::g.adb.UiDevices())
-                            if (d.serial == ser)
-                            {
-                                e.key = App::AdbVolKey(d);       // identity 稳定，换链路不丢音量
-                                e.label = !d.btName.empty() ? Utf8ToWide(d.btName)
-                                        : (!d.model.empty() ? Utf8ToWide(d.model) : Utf8ToWide(ser));
-                                break;
-                            }
-                        if (e.key.empty()) e.key = L"adb:" + Utf8ToWide(ser);   // 设备已消失，退回 serial
-                    }
-                    else if (ss.isBt)
-                    {
-                        // 显示名形如 "… (示例手机 A2DP SNK)"
-                        std::wstring nm = ss.displayName;
-                        size_t p1 = nm.find(L'('), p2 = nm.rfind(L" A2DP");
-                        if (p1 != std::wstring::npos && p2 != std::wstring::npos && p2 > p1)
-                            nm = nm.substr(p1 + 1, p2 - p1 - 1);
-                        std::string bmac;
-                        for (auto& bd : ::g.btDevs) if (bd.name == nm) { bmac = bd.mac; break; }
-                        e.key = App::BtVolKey(nm, bmac);
-                        e.isBt = true;
-                        e.label = nm;
-                    }
-                    else continue;
-
-                    ::g.devVols.push_back(e);
-                }
-
-                // phoneSessions 由 ADB 条目派生，不再单独枚举一遍
-                ::g.phoneSessions.clear();
-                for (auto& e : ::g.devVols)
-                {
-                    if (e.isBt) continue;
-                    PhoneSessionInfo ps;
-                    ps.found = true; ps.playing = e.playing;
-                    ps.volume = e.vol; ps.muted = e.mute;
-                    ps.instanceId = e.instanceId;
-                    ::g.phoneSessions.push_back(ps);
-                }
-
-                if (!::g.phoneSessions.empty()) ::g.session = ::g.phoneSessions.front();
-                else if (!::g.devVols.empty())
-                {
-                    auto& e0 = ::g.devVols.front();
-                    ::g.session = PhoneSessionInfo{};
-                    ::g.session.found = true; ::g.session.playing = e0.playing;
-                    ::g.session.volume = e0.vol; ::g.session.muted = e0.mute;
-                    ::g.session.instanceId = e0.instanceId;
-                }
-                else ::g.session = PhoneSessionInfo{};
-
-                // 汇总：任一设备确实在出声（峰值表，不用 dumpsys）
-                int anyPlaying = 0;
-                for (auto& e : ::g.devVols) if (e.playing) anyPlaying = 1;
-                ::g.phonePlaying = anyPlaying;
-            }
-
-
-            // 默认输出设备：每 1 秒刷一次（原来每 250ms）
-            static int defTick = 0;
-            if (++defTick >= 4) { defTick = 0; RefreshCurrentDefault(); }
-
-            // ---- 缓冲变更：等空闲时执行 ----
-            // 重启 scrcpy 有让 Android 不迁移音频流的风险，所以只在「没在播放」时做。
-            // 这既避免打断音乐，也保证下次播放一开始就是对的缓冲。
-            for (auto& ser : ::g.adb.UiRunningSerials())
-            {
-                if (!::g.adb.UiHasPendingBuffer(ser)) continue;
-
-                bool playing = false;
-                for (auto& e : ::g.devVols)
-                    if (e.key == (L"adb:" + Utf8ToWide(ser))) { playing = e.playing; break; }
-
-                // 开启「空闲时再调整」→ 等没在播放时才重启；关闭 → 立即执行（可能打断）
-                if (!::g.idleReset || !playing)
-                {
-                    std::string s2 = ser;
-                    ::g.adb.Post([s2]{ ::g.adb.ApplyPendingBuffer(s2); });
-                }
-            }
-
-            // 预设模式下的「空闲重置」：不开自适应时，也定期在空闲时重建通道，
-            // 把可能已经退化的音频通道提前刷干净，避免播放中途出问题。
-            if (::g.idleReset && !::g.adb.AutoAdapt())
-            {
-                static DWORD lastIdleReset = 0;
-                DWORD now2 = GetTickCount();
-                if (lastIdleReset == 0 || now2 - lastIdleReset > 20 * 60 * 1000)   // 20 分钟一次
-                {
-                    for (auto& ser : ::g.adb.UiRunningSerials())
-                    {
-                        bool playing = false;
-                        for (auto& e : ::g.devVols)
-                            if (e.key == (L"adb:" + Utf8ToWide(ser))) { playing = e.playing; break; }
-                        if (!playing)
-                        {
-                            lastIdleReset = now2;
-                            std::string s2 = ser;
-                            ::g.adb.Post([s2]{ ::g.adb.ApplyIdleReset(s2); });
-                            break;
-                        }
-                    }
-                }
-            }
-
-            PollBtScan();   // 取回后台枚举的蓝牙设备列表
-
-            // 工作线程请求断开蓝牙 → 在这里（UI 线程）真正执行
-            if (::g.btDisconnectRequest.exchange(false))
-            {
-                ::g.bt.Disconnect();
-                ::g.SetNotice(L"音频被蓝牙占用，已自动断开蓝牙链路", 0, 10000);
-            }
-
-            // ---- ADB 模式下自动转发「所有」在线设备 ----
-            // 不需要用户逐个点 ▶：只要设备已授权且在线，就自动开始转发。
-            // 用户手动点过 ■ 的设备会记在 userStopped 里，不再自动拉起。
-            if (::g.useAdb)
-            {
-                // 迁移：旧版本把勾选存成 IP，这里改成存设备身份，IP 变了也不会丢
-                static bool migrated = false;
-                if (!migrated && !::g.adb.UiDevices().empty())
-                {
-                    migrated = true;
-                    auto devs = ::g.adb.UiDevices();
-                    bool changed = false;
-                    for (auto& d : devs)
-                    {
-                        if (d.identity.empty()) continue;
-                        if (::g.autoDevices.count(d.serial) && !::g.autoDevices.count(d.identity))
-                        {
-                            ::g.autoDevices.erase(d.serial);
-                            ::g.autoDevices.insert(d.identity);
-                            changed = true;
-                        }
-                    }
-                    if (changed) SaveSettings();
-                }
-
-                // 用去重后的列表：否则同一台设备的每个连接入口都会开一个 scrcpy
-                // （手机同时开 tcpip 5555 + 无线调试时实测会开 4 个）
-                auto merged = ::g.adb.UiUniqueDevices();
-                for (auto& d : merged)
-                {
-                    if (d.state != "device" || d.serial.empty()) continue;
-                    if (::g.adb.UiIsRunning(d.serial)) continue;
-                    // 按设备身份判断（IP 变化不影响勾选状态）；兼容旧版按 serial 的记录
-                    bool checked = (!d.identity.empty() && ::g.autoDevices.count(d.identity))
-                                || ::g.autoDevices.count(d.serial);
-                    if (!checked) continue;                           // 只自动连勾选的
-
-                    // 「用户停过」要按身份判断：停的是 A 端口，不代表可以自动起 B 端口
-                    bool stopped = ::g.userStopped.count(d.serial) > 0;
-                    if (!stopped && !d.identity.empty())
-                        for (auto& raw : ::g.adb.UiDevices())
-                            if (raw.identity == d.identity && ::g.userStopped.count(raw.serial)) { stopped = true; break; }
-                    if (stopped) continue;
-
-                    // 「自动重连」关掉后：只有启动阶段才自动起会话。
-                    // 过了启动阶段就完全不碰 —— 开关一次手机 WiFi 即可断开，
-                    // 且不会自己连回来（要恢复就点「刷新」）。
-                    if (!::g.adb.AutoConnectAllowed()) continue;
-
-                    std::string s2 = d.serial;
-                    ::g.adb.Post([s2]{ ::g.adb.StartDevice(s2); });
-                }
-            }
-
-            // ---- 周期性检查：媒体音频是否被蓝牙抢走 ----
-            // 这是「手机在播但电脑静音」最常见的真正原因：
-            // 手机蓝牙还连着电脑，Android 优先把媒体音频送蓝牙，
-            // 而程序升级到 ADB 后已断开蓝牙链路 → 音乐被送进黑洞。
-            // 只要发现这种情况就断开蓝牙，让音频回到可被 ADB 抓取的路径。
-            {
-                static DWORD lastBtCheck = 0;
-                DWORD nowB = GetTickCount();
-                if (::g.useAdb && (lastBtCheck == 0 || nowB - lastBtCheck > 30000))   // 30 秒一次
-                {
-                    auto running = ::g.adb.UiRunningSerials();
-                    if (!running.empty())
-                    {
-                        lastBtCheck = nowB;
-                        std::string s2 = running.front();
-                        ::g.adb.Post([s2]{
-                            if (::g.adb.IsMediaOnBluetooth(s2))
-                            {
-                                ::g.btDisconnectRequest = true;   // 交给 UI 线程执行
-                                ::g.SetNotice(L"音频被蓝牙占用，正在断开蓝牙链路…", 0, 10000);
-                            }
-                        });
-                    }
-                }
-            }
-
-            // ---- 静音自愈 ----
-            // 场景：手机媒体在播（PLAYING），但电脑端一点声音都没有。
-            // 原因是 scrcpy 新建 AudioPolicyMix 时，已在播的 AudioTrack 不会被迁移进去；
-            // 只发 dispatch play 是空操作，必须「暂停→播放」强制 App 重建 AudioTrack。
-            for (auto& ser : ::g.adb.UiRunningSerials())
-            {
-                auto& st = ::g.healState[ser];
-                DWORD spawn = ::g.adb.UiSpawnMs(ser);
-                if (st.spawnMs != spawn)
-                {
-                    st.spawnMs = spawn;
-                    st.silentSince = 0;
-                    st.lastNudge = 0;
-                    st.diagDone = false;
-                }
-
-                bool playing = false;
-                for (auto& e : ::g.devVols)
-                    if (e.key == (L"adb:" + Utf8ToWide(ser))) { playing = e.playing; break; }
-
-                // 持续监控：只要「电脑端完全没声音」，就盯着；持续 15 秒就查一次手机状态。
-                // 播放中途被抢走音频（比如游戏抢焦点把音乐切到听筒）也能抓到，
-                // 而不是只在会话刚启动时查一次。
-                DWORD nowH = GetTickCount();
-                if (playing)
-                {
-                    st.silentSince = 0;
-                    st.diagDone = false;
-                }
-                else
-                {
-                    if (st.silentSince == 0) st.silentSince = nowH;
-
-                    bool longEnough = (nowH - st.silentSince > 15000);
-                    bool notThrottled = (st.lastNudge == 0 || nowH - st.lastNudge > 60000);
-                    if (longEnough && notThrottled)
-                    {
-                        st.lastNudge = nowH;
-                        bool firstDiag = !st.diagDone;
-                        st.diagDone = true;
-
-                        std::string s2 = ser;
-                        int vol = 0; bool mute = false;
-                        for (auto& e : ::g.devVols)
-                            if (e.key == (L"adb:" + Utf8ToWide(ser)))
-                            { vol = (int)(e.vol * 100); mute = e.mute; break; }
-                        std::wstring extra = L"pc_volume=" + std::to_wstring(vol)
-                                           + L"% pc_mute=" + std::to_wstring((int)mute)
-                                           + L" silent_for=" + std::to_wstring(nowH - st.silentSince) + L"ms";
-
-                        // 自己把音量调到很低或静音了 → 这不是故障，别去打断播放
-                        if (mute || vol < 5) continue;
-
-                        ::g.adb.Post([s2, extra, firstDiag]{
-                            if (!::g.adb.IsMediaPlaying(s2)) return;   // 手机没在播就不管
-                            if (firstDiag) ::g.adb.DumpSilentDiag(s2, extra);
-                            if (::g.adb.IsMediaOnBluetooth(s2))
-                            {
-                                ::g.btDisconnectRequest = true;
-                                ::g.SetNotice(L"音频被蓝牙占用，正在断开蓝牙链路…", 0, 10000);
-                                return;
-                            }
-                            ::g.SetNotice(L"检测到没有声音，正在尝试恢复…", 1, 10000);
-                            ::g.adb.NudgeMedia(s2);                    // 强制重建音频流
-                        });
-                    }
-                }
-            }
-            for (auto it = ::g.healState.begin(); it != ::g.healState.end();)
-            {
-                if (!::g.adb.UiIsRunning(it->first)) it = ::g.healState.erase(it);
-                else ++it;
-            }
-
-            if (!::g.volSelInit && ::g.volMode == 1 && !::g.devVols.empty() && !::g.SelectedEntry())
-            {
-                auto rows = CurrentRows();
-                for (int i = 0; i < (int)rows.size(); i++)
-                {
-                    std::wstring key = ::g.useAdb ? (L"adb:" + Utf8ToWide(rows[i].serial))
-                                                  : App::BtVolKey(rows[i].name, rows[i].btMac);
-                    if (::g.FindDevVol(key))
-                    {
-                        if (::g.useAdb) ::g.adbSel = i; else ::g.btSel = i;
-                        ::g.volSelInit = true;   // 真正选中了才算完成
-                        break;
-                    }
-                }
-            }
-
-
-            // 逐设备同步音量/静音；系统全局音量绝不触碰
-            //   全局模式：所有设备跟随同一个滑块值
-            //   单个模式：每台设备只跟随它自己的设定，未设定过的不动
-            for (auto& e : ::g.devVols)
-            {
-                float want;
-                bool wmute;
-                if (::g.volMode == 0)
-                {
-                    want = ::g.phoneVol;
-                    wmute = ::g.phoneMute;
-                    // 只在这台设备还没自己的基准时写入，之后不再每秒覆写。
-                    // 否则「单个模式」下调好的值会被全局模式冲掉（切回去就变回原来的）。
-                    if (!::g.devVolPref.count(e.key))  ::g.devVolPref[e.key]  = want;
-                    if (!::g.devMutePref.count(e.key)) ::g.devMutePref[e.key] = wmute;
-                }
-                else
-                {
-                    auto it = ::g.devVolPref.find(e.key);
-                    auto itm = ::g.devMutePref.find(e.key);
-                    if (it == ::g.devVolPref.end() && itm == ::g.devMutePref.end()) continue;
-                    want = (it != ::g.devVolPref.end()) ? it->second : e.vol;
-                    wmute = (itm != ::g.devMutePref.end()) ? itm->second : e.mute;
-                }
-
-                if (!::g.dragSlider && std::abs(e.vol - want) > 0.02f)
-                    { PerfScope pV("  SetSessionVolume", 20.0, 0); ::g.oa.SetSessionVolume(e.instanceId, want); }
-                if (e.mute != wmute)
-                    { PerfScope pM("  SetSessionMute", 20.0, 0); ::g.oa.SetSessionMute(e.instanceId, wmute); }
-            }
-
-            bool linkUp = LinkUp();
-            if (linkUp && ::g.fixedMode && !::g.routed) ApplyRouting();
-            if (!linkUp && ::g.routed) RestoreRouting();
-
-            UpdateTray();
-
-            // 内容没变化就不重绘（拖滑块时需要连续重绘）
-            static size_t lastSig = 0;
-            size_t sig = ::g.VisualSig();
-            if (::g.dragSlider || sig != lastSig)
-            {
-                lastSig = sig;
-                if (!IsIconic(hwnd)) InvalidateRect(hwnd, nullptr, FALSE);
-            }
-        }
+        if (wp == 1) UiTick(hwnd);
         return 0;
 
     case WM_ENDSESSION:
@@ -5477,7 +4678,7 @@ static LRESULT CALLBACK WndProcInner(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 // 这里兜住、记一行、让程序继续跑（GDI+ 分配失败、容器越界都走这里）。
 //
 // 注意：这是「包装函数」而不是「在 WndProcInner 里套 try」——
-// 后者需要把 850 行 switch 整体缩进一级，diff 会变成整文件重写，review 时看不清。
+// 后者需要把整个 switch 缩进一级，diff 会变成整文件重写，降低审阅清晰度。
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     try { return WndProcInner(hwnd, msg, wp, lp); }
@@ -5730,7 +4931,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int)
 
     GdiplusStartupInput gsi;
     GdiplusStartup(&g_gdiToken, &gsi, nullptr);
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hrCo) && hrCo != RPC_E_CHANGED_MODE)
+        PerfLog("CoInitializeEx 失败：0x%08X", (unsigned)hrCo);
 
     LoadSettings();
     ApplyAutoStart();

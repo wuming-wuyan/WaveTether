@@ -55,7 +55,9 @@ const wchar_t* BtLink::StateText() const { return StateName(state_); }
 
 bool BtLink::Init()
 {
-    try { ::RoInitialize(RO_INIT_MULTITHREADED); } catch (...) {}
+    HRESULT hr = ::RoInitialize(RO_INIT_MULTITHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE)
+        PerfLog("RoInitialize 失败：0x%08X（蓝牙音频可能不可用）", (unsigned)hr);
     if (!impl_) impl_ = new Impl();
     return true;
 }
@@ -136,7 +138,7 @@ void BtLink::Connect(const std::wstring& deviceId, const std::wstring& deviceNam
     {
         impl_->conn = wa::AudioPlaybackConnection::TryCreateFromId(deviceId);
     }
-    catch (...) { impl_->conn = nullptr; }
+    catch (...) { impl_->conn = nullptr; PerfLog("BT 连接对象创建失败（设备 id 可能已失效）"); }
 
     if (!impl_->conn)
     {
@@ -186,14 +188,14 @@ void BtLink::Tick()
         if (!im.startOp)
         {
             try { im.startOp = im.conn.StartAsync(); im.startWait = 0; }
-            catch (...) { im.started = true; }
+            catch (...) { im.started = true; PerfLog("BT StartAsync 抛异常，本次连接不再重试启动"); }
         }
         if (im.startOp)
         {
             auto st = im.startOp.Status();
             if (st == wf::AsyncStatus::Completed)
             {
-                try { im.startOp.GetResults(); } catch (...) {}
+                try { im.startOp.GetResults(); } catch (...) { PerfLog("BT StartAsync 完成但 GetResults 失败"); }
                 im.startOp = nullptr;
                 im.started = true;
             }
@@ -202,7 +204,7 @@ void BtLink::Tick()
                 im.startOp = nullptr;
                 im.started = true;
             }
-            else if (++im.startWait > 20) { im.startOp = nullptr; im.started = true; }   // 20 秒超时
+            else if (++im.startWait > 20) { im.startOp = nullptr; im.started = true; }   // 250ms tick → 5 秒超时
         }
     }
 
@@ -210,7 +212,9 @@ void BtLink::Tick()
     if (im.ticksToNextOpen > 0) { im.ticksToNextOpen--; }
     else if (!im.openOp)
     {
-        try { im.openOp = im.conn.OpenAsync(); im.openWait = 0; } catch (...) {}
+        // 新一次 OpenAsync 必须重新计时；沿用上一次的计数会让新操作下一拍就判超时。
+        try { im.openOp = im.conn.OpenAsync(); im.openWait = 0; }
+        catch (...) { im.ticksToNextOpen = 8; PerfLog("BT OpenAsync 抛异常，2 秒后重试"); }
     }
 
     if (im.openOp)
@@ -218,7 +222,7 @@ void BtLink::Tick()
         auto st = im.openOp.Status();
         if (st == wf::AsyncStatus::Completed)
         {
-            try { im.openOp.GetResults(); } catch (...) {}
+            try { im.openOp.GetResults(); } catch (...) { PerfLog("BT OpenAsync 完成但 GetResults 失败"); }
             im.openOp = nullptr;
             if (im.conn.State() == wa::AudioPlaybackConnectionState::Opened)
             {
@@ -235,7 +239,7 @@ void BtLink::Tick()
                 int shift = im.openAttempts - 1;
                 if (shift > 3) shift = 3;
                 int seconds = 1 << shift;          // 1,2,4,8
-                im.ticksToNextOpen = seconds;      // 单位：秒（Tick 每秒跑一次状态机）
+                im.ticksToNextOpen = seconds;      // 单位：tick（250ms），即 1/2/4/8 tick
             }
         }
         else if (st == wf::AsyncStatus::Error || st == wf::AsyncStatus::Canceled)
@@ -248,10 +252,10 @@ void BtLink::Tick()
             if (shift > 3) shift = 3;
             im.ticksToNextOpen = (1 << shift);
         }
-        else if (++im.openWait > 30)   // 30 秒超时
+        else if (++im.openWait > 30)   // 250ms tick → 7.5 秒超时
         {
             im.openOp = nullptr;
-            im.ticksToNextOpen = 8;   // 8 秒后再试
+            im.ticksToNextOpen = 8;   // 8 tick = 2 秒后再试
         }
     }
 }

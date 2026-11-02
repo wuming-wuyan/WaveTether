@@ -7,6 +7,7 @@ native/embed_hash.txt
 native/*.obj
 native/*.res
 native/WaveTether.exe
+native/WaveTether-BT-only.exe
 native/WaveTether-single.exe
 native/test_*.exe
 native/*.log
@@ -21,7 +22,8 @@ native/tools/scrcpy/*.zip
 # 本地目录
 history/
 shots/
-.local/agent-work/
+.local/
+build-cmake/
 
 # 系统文件
 Thumbs.db

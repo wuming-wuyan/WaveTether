@@ -1,0 +1,24 @@
+# WaveTether static-analysis baseline
+# <file>\t<code>\t<count>; regenerate with --update
+main.cpp	C4459	24
+main.cpp	C6244	24
+adb.cpp	C28159	8
+WindowsNumerics.inl	C28253	5
+WindowsNumerics.inl	C28252	3
+WindowsNumerics.inl	C6101	3
+ui_tick.inc	C28159	3
+GdiplusFontCollection.h	C6385	2
+adb.cpp	C4456	2
+adb.cpp	C6246	2
+help_runtime.inc	C4459	2
+help_runtime.inc	C6244	2
+main.cpp	C4189	2
+main.cpp	C6031	2
+ws2tcpip.h	C6101	2
+GdiplusFontCollection.h	C28252	1
+GdiplusFontCollection.h	C28253	1
+main.cpp	C28251	1
+main.cpp	C4100	1
+main.cpp	C4456	1
+main.cpp	C6246	1
+winreg.h	C6553	1

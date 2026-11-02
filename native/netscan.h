@@ -11,7 +11,12 @@ namespace netscan
 inline void EnsureWsa()
 {
     static bool done = false;
-    if (!done) { WSADATA d; WSAStartup(MAKEWORD(2, 2), &d); done = true; }
+    if (!done)
+    {
+        WSADATA d;
+        if (WSAStartup(MAKEWORD(2, 2), &d) != 0) return;   // 失败不标记完成，下次再试
+        done = true;
+    }
 }
 
 // 以 hintIp 的前三段为网段，扫描 1..254 的 5555 端口

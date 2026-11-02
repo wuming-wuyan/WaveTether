@@ -6,7 +6,7 @@
 #
 # 产出：
 #   embed.rc           资源脚本（每个文件一个 RCDATA，序号为资源名）
-#   embed_manifest.txt "序号 <TAB> 相对路径 <TAB> 原始大小 <TAB> 压缩后大小"
+#   embed_manifest.txt "序号 <TAB> 相对路径 <TAB> 原始大小 <TAB> 压缩后大小 <TAB> SHA-256"
 #                      （压缩后大小 = 0 表示该文件未压缩，按原样写入）
 #   embed_hash.txt     内嵌内容的 8 位哈希（决定运行时释放目录名）
 #   embed_blobs\       实际嵌入的二进制（压缩后的，或未压缩的原始文件）
@@ -136,8 +136,11 @@ def main():
         blob_path = os.path.join(BLOBS, '%d.bin' % i)
         with open(blob_path, 'wb') as f:
             f.write(blob)
-        rc.append('%d RCDATA "%s"' % (i, blob_path.replace('\\', '\\\\')))
-        manifest.append('%d\ttools/scrcpy/%s/%s\t%d\t%d' % (i, base, name, len(data), comp_size))
+        # 绝对路径：CMake 在 build 目录里调 rc.exe，相对路径会找不到 blob
+        rc.append('%d RCDATA "%s"' % (i, os.path.abspath(blob_path).replace('\\', '\\\\')))
+        manifest.append('%d\ttools/scrcpy/%s/%s\t%d\t%d\t%s'
+                        % (i, base, name, len(data), comp_size,
+                           hashlib.sha256(data).hexdigest()))
 
     short = digest.hexdigest()[:8]
 

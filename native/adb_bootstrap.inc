@@ -23,7 +23,7 @@ static std::vector<std::string> ListWiredDevices(AdbChannel* self)
 void AdbChannel::BootstrapTick()
 {
     if (adbPath_.empty()) return;
-    if (++bootTick_ % 8 != 0) return;      // 250ms tick → 每 2 秒一次
+    if (!bootGate_.Due(2000)) return;
 
     // 注意：不能用「wirelessIp_ 非空」当闸门——它会被持久化/自动采纳，
     // 几乎总是非空，结果 USB 引导（tcpip 5555）永远不执行。
@@ -37,7 +37,7 @@ void AdbChannel::BootstrapTick()
         bool mDNS = ser.find("_adb-tls-") != std::string::npos;
         if (ser.find(':') == std::string::npos && !mDNS) continue;
         if (mDNS) return;      // mDNS 名字里没有 IP，采纳它没有意义（也不需要再 arm）
-        wirelessIp_ = ser.substr(0, ser.find(':'));
+        SetWirelessIp(ser.substr(0, ser.find(':')));
         // 只在这个值真的变了时记一行：否则每 2 秒刷一次日志，文件很快被撑大
         static std::string lastAdopted;
         if (lastAdopted != ser) { lastAdopted = ser; PerfLog("ADB Bootstrap: 采纳已在线的无线设备 %s", ser.c_str()); }
@@ -45,6 +45,9 @@ void AdbChannel::BootstrapTick()
     }
 
     // ② 有 USB → 对「还没 arm 过」的设备执行 tcpip 5555 把无线打开
+    // 用户可以在设置里关掉「自动开启无线 ADB」：关闭后只保留上面「采纳已在线设备」，
+    // 不再主动把手机端口开到网络上。
+    if (!autoArmWireless_) return;
     auto wired = ListWiredDevices(this);
     if (wired.empty())
     {
@@ -76,7 +79,7 @@ void AdbChannel::BootstrapTick()
         return;
     }
 
-    wirelessIp_ = ip;
+    SetWirelessIp(ip);
     armedSerials_.insert(target);     // 这台已 arm，不再重复
     PerfLog("ADB Bootstrap: 已对 %s 执行 tcpip 5555，IP=%s", target.c_str(), ip.c_str());
 

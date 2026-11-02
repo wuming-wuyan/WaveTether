@@ -2,11 +2,20 @@
 #pragma code_page(65001)
 ﻿#include <windows.h>
 
+// 蓝牙版和便携版是同一份代码，只有这里的文件名不同。
+// build.bat 用 rc /d BT_ONLY；CMake 用 app_bt.rc 先定义同名宏再包含本文件。
+#ifdef BT_ONLY
+#define APP_ORIGINAL_FILENAME "WaveTether-BT-only.exe"
+#endif
+#ifndef APP_ORIGINAL_FILENAME
+#define APP_ORIGINAL_FILENAME "WaveTether.exe"
+#endif
+
 IDI_APP ICON "app.ico"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     1,0,0,0     // 必须与 version.h 的 APP_VERSION_4C 一致（rc.exe 不展开逗号宏，由 make_dist.py --verify 校验）
-PRODUCTVERSION  1,0,0,0
+FILEVERSION     1,1,0,0     // 必须与 version.h 的 APP_VERSION_4C 一致（rc.exe 不展开逗号宏，由 make_dist.py --verify 校验）
+PRODUCTVERSION  1,1,0,0
 FILEFLAGSMASK   0x3fL
 FILEFLAGS       0x0L
 FILEOS          VOS_NT_WINDOWS32
@@ -21,10 +30,10 @@ BEGIN
             VALUE "FileDescription",  "WaveTether - 设备音频转发到电脑"
             VALUE "FileVersion",      APP_VERSION_4A
             VALUE "InternalName",     "WaveTether"
-            VALUE "OriginalFilename", "WaveTether.exe"
+            VALUE "OriginalFilename", APP_ORIGINAL_FILENAME
             VALUE "ProductName",      "WaveTether"
             VALUE "ProductVersion",   APP_VERSION_4A
-            VALUE "LegalCopyright",   "Copyright (C) 2026 WaveTether contributors"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 wuming-wuyan"
             VALUE "Comments",         "免安装版"
         END
     END

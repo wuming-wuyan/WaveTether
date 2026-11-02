@@ -1,13 +1,70 @@
 // ---- 单文件版：内嵌工具释放 ----
 // 资源由 gen_embed.py 生成：
 //   1..N  RCDATA        每个文件（资源名是序号；内容可能是 XPRESS 压缩后的）
-//   IDR_EMBED_MANIFEST  "序号<TAB>相对路径<TAB>原始大小<TAB>压缩后大小"
+//   IDR_EMBED_MANIFEST  "序号<TAB>相对路径<TAB>原始大小<TAB>压缩后大小<TAB>SHA-256"
 //                       （压缩后大小 = 0 表示未压缩，按原样写入）
 //   IDR_EMBED_HASH      内嵌内容的 8 位哈希（决定释放目录名）
 //
 // 释放到 %TEMP%\WaveTether\rt-<哈希>\，退出时不删除：
 // Temp 的语义就是「可以随时清掉的临时文件」，用户清掉后下次启动会重新释放。
 // 换版本（哈希变化）时启动会修剪旧的 rt-* 目录。
+
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
+
+// 逐文件 SHA-256：大小校验挡不住「同尺寸替换」，这一层用来发现内容被改。
+static bool Sha256File(const std::wstring& path, std::string& hexOut)
+{
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE h = nullptr;
+    bool ok = false;
+    DWORD objLen = 0, cb = 0;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) return false;
+    if (BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&objLen, sizeof(objLen), &cb, 0) == 0)
+    {
+        std::vector<UCHAR> obj(objLen);
+        if (BCryptCreateHash(alg, &h, obj.data(), objLen, nullptr, 0, 0) == 0)
+        {
+            HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (f != INVALID_HANDLE_VALUE)
+            {
+                std::vector<UCHAR> buf(1 << 16);
+                ok = true;
+                for (;;)
+                {
+                    DWORD read = 0;
+                    if (!ReadFile(f, buf.data(), (DWORD)buf.size(), &read, nullptr))
+                    {
+                        // 读失败（独占/IO 错误）不能把已读前缀当成完整内容去比哈希，
+                        // 否则会误判成「文件损坏」并触发重建。
+                        ok = false;
+                        break;
+                    }
+                    if (read == 0) break;                 // EOF
+                    if (BCryptHashData(h, buf.data(), read, 0) != 0) { ok = false; break; }
+                }
+                CloseHandle(f);
+            }
+            UCHAR dig[32];
+            if (ok && BCryptFinishHash(h, dig, sizeof(dig), 0) == 0)
+            {
+                static const char* kHex = "0123456789abcdef";
+                hexOut.clear();
+                hexOut.reserve(64);
+                for (UCHAR c : dig)
+                {
+                    hexOut.push_back(kHex[c >> 4]);
+                    hexOut.push_back(kHex[c & 15]);
+                }
+            }
+            else ok = false;
+        }
+    }
+    if (h) BCryptDestroyHash(h);
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+}
 
 // 递归删除目录（失败静默：文件可能正被占用）
 static void RemoveDirTree(const std::wstring& dir)
@@ -135,6 +192,7 @@ struct EmbedEntry
     std::wstring rel;
     DWORD origSize;
     DWORD compSize;      // 0 = 未压缩
+    std::string sha256;  // 原始内容的 SHA-256（小写十六进制）
 };
 
 // 释放失败时记下原因：调用方会当成「分离版」继续走，若不记录就只剩一句
@@ -218,7 +276,7 @@ std::wstring AdbChannel::ExtractEmbeddedTools(bool prune)
                 if (t == std::string::npos) break;
                 sp = t + 1;
             }
-            if (f.size() < 4) continue;
+            if (f.size() < 5) continue;
             for (auto& x : f) while (!x.empty() && (x.back() == '\r' || x.back() == ' ')) x.pop_back();
 
             int id = atoi(f[0].c_str());
@@ -232,6 +290,7 @@ std::wstring AdbChannel::ExtractEmbeddedTools(bool prune)
             e.rel = relW;
             e.origSize = (DWORD)strtoul(f[2].c_str(), nullptr, 10);
             e.compSize = (DWORD)strtoul(f[3].c_str(), nullptr, 10);
+            e.sha256 = f[4];
             if (e.origSize == 0 || e.origSize > 512u * 1024 * 1024) continue;
             entries.push_back(e);
         }
@@ -269,8 +328,15 @@ std::wstring AdbChannel::ExtractEmbeddedTools(bool prune)
             }
             ULONGLONG sz = ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
             // 光看「文件在不在」不够：截断、被换成同名小文件、被换成链接都算不可信。
-            // 这里至少卡住大小与重解析点（逐字节哈希暂未做，代价与收益见 README）。
             if (sz != e.origSize || (fad.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+            {
+                complete = false;
+                missing = e.rel;
+                break;
+            }
+            // 大小相同也可能是被换过的内容：逐文件比 SHA-256。
+            std::string got;
+            if (!Sha256File(f, got) || got != e.sha256)
             {
                 complete = false;
                 missing = e.rel;
@@ -311,8 +377,12 @@ std::wstring AdbChannel::ExtractEmbeddedTools(bool prune)
                 embedStale_ = missing;
             return std::wstring();
         }
-        RemoveDirTree(base);      // 不完整就整个重来
+        // 不完整就重来，但不要先删旧目录：目录里有文件被占用时（杀软扫描、残留进程），
+        // 删一半又写不进去，会把整个运行时目录毁掉。先完整写到 -new 再换名。
     }
+
+    std::wstring staging = base + L"-new";
+    RemoveDirTree(staging);       // 上次中途退出留下的半成品
 
     // ---- 首次释放 ----
     std::vector<BYTE> plain;
@@ -349,7 +419,7 @@ std::wstring AdbChannel::ExtractEmbeddedTools(bool prune)
             break;
         }
 
-        std::wstring outPath = base + L"\\" + e.rel;
+        std::wstring outPath = staging + L"\\" + e.rel;
         size_t sep = outPath.find_last_of(L'\\');
         if (sep != std::wstring::npos) MakeDirs(outPath.substr(0, sep));
 
@@ -372,9 +442,26 @@ std::wstring AdbChannel::ExtractEmbeddedTools(bool prune)
 
     if (!embedError_.empty())
     {
-        // 半成品目录留着会让下次启动误判「已释放」，直接清掉重来
-        RemoveDirTree(base);
+        RemoveDirTree(staging);    // 只清半成品，旧目录原样保留
         return std::wstring();
     }
-    return base;
+
+    // 用新目录替换旧目录。旧目录可能被占用（scrcpy 还在跑、杀软在扫），
+    // 换名失败就直接用 staging：这一轮照常能用，旧目录留给下次启动清理。
+    if (GetFileAttributesW(base.c_str()) == INVALID_FILE_ATTRIBUTES)
+    {
+        if (MoveFileExW(staging.c_str(), base.c_str(), 0)) return base;
+        PerfLog("运行时目录换名失败，改用 %s", PerfU8(staging).c_str());
+        return staging;
+    }
+    std::wstring oldDir = base + L"-old";
+    RemoveDirTree(oldDir);
+    if (MoveFileExW(base.c_str(), oldDir.c_str(), 0) &&
+        MoveFileExW(staging.c_str(), base.c_str(), 0))
+    {
+        RemoveDirTree(oldDir);
+        return base;
+    }
+    PerfLog("运行时目录被占用，本轮改用 %s", PerfU8(staging).c_str());
+    return staging;
 }

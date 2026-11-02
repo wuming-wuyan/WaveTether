@@ -4,9 +4,9 @@
 # 产出（dist/）：
 #   WaveTether.exe                  完整版（单文件，内嵌 adb/scrcpy，14 MB）——直接发这个
 #   WaveTether-BT-only.exe          极简版（671 KB，只有蓝牙，不含 ADB 工具）
-#   WaveTether-1.0.0-portable.zip   便携版（exe + tools\，不写临时文件）——有文件夹，必须打包
+#   WaveTether-<版本>-portable.zip   便携版（exe + tools\，不写临时文件）——有文件夹，必须打包
 #   使用说明.txt                    内容可直接复制粘贴到聊天里
-#   发布说明-1.0.0.txt               收件人第一眼看的：三个版本怎么选、SmartScreen、怎么反馈
+#   发布说明-<版本>.txt              收件人第一眼看的：三个版本怎么选、SmartScreen、怎么反馈
 #   SHA256SUMS.txt
 #
 # 为什么不把单文件版也压成 zip：
@@ -22,7 +22,7 @@ import zipfile
 
 
 def read_version():
-    """版本号只从 native/version.h 读 —— 以前这里写死一份，和 exe 里的会对不上。"""
+    """版本号只从 native/version.h 读取，避免源码与 exe 的版本信息不一致。"""
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                '..', 'native', 'version.h'), encoding='utf-8') as f:
@@ -40,6 +40,7 @@ NATIVE = os.path.join(ROOT, 'native')
 DIST = os.path.join(ROOT, 'dist')
 
 EXE_SEP = os.path.join(NATIVE, 'WaveTether.exe')
+EXE_BT = os.path.join(NATIVE, 'WaveTether-BT-only.exe')
 EXE_SINGLE = os.path.join(NATIVE, 'WaveTether-single.exe')
 NOTE = os.path.join(DIST, '使用说明.txt')
 # 收件人第一眼看的文件：版本、怎么选、SmartScreen 怎么过、出问题发什么
@@ -223,9 +224,10 @@ def main():
     if '--verify' in sys.argv:
         return verify_dist()
 
-    for p in (EXE_SEP, EXE_SINGLE, NOTE, RELEASE_NOTE):
+    for p in (EXE_SEP, EXE_BT, EXE_SINGLE, NOTE, RELEASE_NOTE):
         if not os.path.exists(p):
-            raise SystemExit('!! 缺少 %s，请先构建/补齐文档' % p)
+            hint = '（蓝牙版要先跑 native\\build.bat bt）' if p == EXE_BT else ''
+            raise SystemExit('!! 缺少 %s%s，请先构建/补齐文档' % (p, hint))
     missing = [f for f in RUNTIME if not os.path.exists(os.path.join(SCRCPY_SRC, f))]
     if missing:
         raise SystemExit('!! tools 目录缺少: %s' % ', '.join(missing))
@@ -242,14 +244,14 @@ def main():
 
     out = [
         copy_exe(EXE_SINGLE, DIST_EXE),        # 完整版：裸 exe，直接发
-        copy_exe(EXE_SEP, DIST_EXE_LITE),      # 蓝牙版：裸 exe
+        copy_exe(EXE_BT, DIST_EXE_LITE),       # 蓝牙版：裸 exe（单独编译，OriginalFilename 正确）
         build_portable(),
     ]
     if '--zip-single' in sys.argv:
         out.append(build_single_zip())
 
     with open(os.path.join(DIST, 'SHA256SUMS.txt'), 'w', encoding='utf-8', newline='\n') as f:
-        # 说明文档也算交付物，一并列进来（历史上漏过，导致 zip 里是旧版文档没人发现）
+        # 说明文档也算交付物，一并列进来，保证 zip 与清单中的文档始终同步
         f.write('# WaveTether %s 交付校验：sha256sum -c SHA256SUMS.txt\n' % VERSION)
         f.write('# 注意：这里的 WaveTether.exe 是「单文件完整版」；\n')
         f.write('#       压缩包里的 WaveTether.exe 是同一个程序（配 tools 用），不是同一个文件。\n')

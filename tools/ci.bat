@@ -6,8 +6,8 @@ rem  NOTE: keep this file ASCII-only. cmd.exe parses .bat with the OEM code page
 rem  so UTF-8 Chinese here gets mangled and the script breaks. (Project README
 rem  documents this pitfall.) Chinese messages live in the .py files instead.
 rem
-rem  What it guards against -- two accidents that actually happened:
-rem    * code that does not compile (committed without building)
+rem  What it guards against:
+rem    * code that does not compile
 rem    * packaging that misses files (license text not in zip / not embedded)
 rem ===========================================================================
 setlocal
@@ -20,19 +20,16 @@ rem "LNK1104: cannot open file" -- which reads like a broken build, not "close t
 rem Use the absolute findstr path: when this .bat is launched from Git Bash, PATH puts
 rem /usr/bin first and a bare "find" resolves to the Unix one ("find: '/I': No such file"),
 rem which silently disables this check.
-tasklist /FI "IMAGENAME eq WaveTether.exe" 2>nul | "%SystemRoot%\System32\findstr.exe" /I /C:"WaveTether.exe" >nul
-if not errorlevel 1 (
-    echo [FAIL] WaveTether.exe is running - close it first ^(it locks the exe we link to^)
-    exit /b 1
-)
-tasklist /FI "IMAGENAME eq WaveTether-single.exe" 2>nul | "%SystemRoot%\System32\findstr.exe" /I /C:"WaveTether-single.exe" >nul
-if not errorlevel 1 (
-    echo [FAIL] WaveTether-single.exe is running - close it first
-    exit /b 1
+for %%e in (WaveTether.exe WaveTether-BT-only.exe WaveTether-single.exe) do (
+    tasklist /FI "IMAGENAME eq %%e" 2>nul | "%SystemRoot%\System32\findstr.exe" /I /C:"%%e" >nul
+    if not errorlevel 1 (
+        echo [FAIL] %%e is running - close it first ^(it locks the exe we link to^)
+        exit /b 1
+    )
 )
 
 echo.
-echo === 1/6 unit tests ===
+echo === 1/9 unit tests ===
 if not exist native\obj mkdir native\obj >nul 2>&1
 call native\env.bat >nul 2>&1
 if errorlevel 1 (
@@ -50,25 +47,36 @@ if errorlevel 1 (
 )
 
 echo.
-echo === 2/6 build portable ===
+echo === 2/9 build portable ===
 call native\build.bat
 if errorlevel 1 set FAILED=1
 
 echo.
-echo === 3/6 build single-file ===
+echo === 3/9 build bluetooth-only ===
+call native\build.bat bt
+if errorlevel 1 set FAILED=1
+
+echo.
+echo === 4/9 build single-file ===
 call native\build_single.bat
 if errorlevel 1 set FAILED=1
 
 echo.
-rem WaveTether.exe covers both portable and bluetooth-only forms; single-file is separate.
-echo === 4/6 selftest (portable/bluetooth + single-file, exit 0 = pass) ===
+echo === 5/9 selftest (portable + bluetooth-only + single-file, exit 0 = pass) ===
 native\WaveTether.exe --selftest
+if errorlevel 1 set FAILED=1
+native\WaveTether-BT-only.exe --selftest
 if errorlevel 1 set FAILED=1
 native\WaveTether-single.exe --selftest
 if errorlevel 1 set FAILED=1
 
 echo.
-echo === 5/6 package ===
+echo === 6/9 static analysis (/analyze, baseline gate) ===
+call tools\analyze.bat
+if errorlevel 1 set FAILED=1
+
+echo.
+echo === 7/9 package ===
 if not "%FAILED%"=="0" (
     echo   [SKIP] earlier steps failed - NOT packaging ^(would ship a zip built from stale exes^)
     set FAILED=1
@@ -78,10 +86,15 @@ if not "%FAILED%"=="0" (
 )
 
 echo.
-echo === 6/6 verify artifacts ===
+echo === 8/9 verify artifacts ===
 python tools\make_dist.py --verify
 if errorlevel 1 set FAILED=1
 python tools\check_legal.py
+if errorlevel 1 set FAILED=1
+
+echo.
+echo === 9/9 cmake build + selftest ===
+call tools\cmake_check.bat
 if errorlevel 1 set FAILED=1
 
 echo.

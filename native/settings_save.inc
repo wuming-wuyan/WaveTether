@@ -1,5 +1,22 @@
 // SaveSettings 单独放这里，避免主文件里的转义地狱
 // 由 main.cpp #include 引入
+static int VolPercent(float v) { return (int)(v * 100.f + 0.5f); }
+
+static void AppendVolEntry(std::string& s, bool& first, const std::wstring& k, float v)
+{
+    if (!first) s += ", ";
+    first = false;
+    char buf[32]; sprintf_s(buf, "%d", VolPercent(v));
+    s += "\"" + JsonEscape(WideToUtf8(k)) + "\": " + buf;
+}
+
+static void AppendMuteEntry(std::string& s, bool& first, const std::wstring& k, bool m)
+{
+    if (!first) s += ", ";
+    first = false;
+    s += "\"" + JsonEscape(WideToUtf8(k)) + "\": " + (m ? "true" : "false");
+}
+
 static void SaveSettings()
 {
     EnsureSettingsPath();
@@ -18,6 +35,7 @@ static void SaveSettings()
     s += "  \"IdleReset\": " + std::string(::g.idleReset ? "true" : "false") + ",\n";
     s += "  \"AutoUpgrade\": " + std::string(::g.autoUpgrade ? "true" : "false") + ",\n";
     s += "  \"AutoReconnect\": " + std::string(::g.autoReconnect ? "true" : "false") + ",\n";
+    s += "  \"AutoArmWireless\": " + std::string(::g.autoArmWireless ? "true" : "false") + ",\n";
     s += "  \"DualChannel\": " + std::string(::g.adb.DualChannel() ? "true" : "false") + ",\n";
     s += "  \"AutoDual\": " + std::string(::g.adb.AutoDual() ? "true" : "false") + ",\n";
     s += "  \"SetupDone\": " + std::string(::g.setupDone ? "true" : "false") + ",\n";
@@ -113,23 +131,40 @@ static void SaveSettings()
     s += "  \"DevVol\": {";
     {
         bool first = true;
-        for (auto& kv : ::g.devVolPref)
+        for (auto& kv : ::g.devVolPref) AppendVolEntry(s, first, kv.first, kv.second);
+        // 还没等到设备上线的旧键也写回去，否则「升级后先开程序、后连手机」就丢了。
+        // 上限 16 条：它们是候选，不是当前设置，别让换了 IP 的历史无限堆积。
+        int legacy = 0, dropped = 0;
+        for (auto& kv : ::g.legacyVol)
         {
-            if (!first) s += ", ";
-            first = false;
-            char buf[32]; sprintf_s(buf, "%d", (int)(kv.second * 100.f + 0.5f));
-            s += "\"" + JsonEscape(WideToUtf8(kv.first)) + "\": " + buf;
+            if (::g.devVolPref.count(kv.first)) continue;
+            if (legacy >= 16) { ++dropped; continue; }
+            ++legacy;
+            AppendVolEntry(s, first, kv.first, kv.second);
+        }
+        if (dropped)
+        {
+            static bool logged = false;
+            if (!logged) { logged = true; PerfLog("旧音量键超过 16 条，本次丢弃 %d 条", dropped); }
         }
     }
     s += "},\n";
     s += "  \"DevMute\": {";
     {
         bool first = true;
-        for (auto& kv : ::g.devMutePref)
+        for (auto& kv : ::g.devMutePref) AppendMuteEntry(s, first, kv.first, kv.second);
+        int legacy = 0, dropped = 0;
+        for (auto& kv : ::g.legacyMute)
         {
-            if (!first) s += ", ";
-            first = false;
-            s += "\"" + JsonEscape(WideToUtf8(kv.first)) + "\": " + (kv.second ? "true" : "false");
+            if (::g.devMutePref.count(kv.first)) continue;
+            if (legacy >= 16) { ++dropped; continue; }
+            ++legacy;
+            AppendMuteEntry(s, first, kv.first, kv.second);
+        }
+        if (dropped)
+        {
+            static bool logged = false;
+            if (!logged) { logged = true; PerfLog("旧静音键超过 16 条，本次丢弃 %d 条", dropped); }
         }
     }
     s += "},\n";

@@ -4,6 +4,7 @@
 #include <string>
 #include <windows.h>
 #include "perf.h"
+#include "periodic.h"
 #include <vector>
 #include <map>
 #include <set>
@@ -57,6 +58,11 @@ public:
     void StartWorker();
     void StopWorker();
     void Post(std::function<void()> fn);
+    // 关键任务（用户启停、配对、升级）：队列满也不丢。
+    // 这些任务在投递前就置了忙标志，丢了会让「正在配对/正在升级」永久卡住。
+    [[nodiscard]] bool PostCritical(std::function<void()> fn);
+    // 周期性的「探测列表」任务：队列里已有一个就丢掉新的，避免工作线程被卡住时堆积
+    void PostProbe(std::function<void()> fn);
     // BT 升级到 ADB 的异步结果（工作线程置位，UI 取走）
     bool ConsumeUpgraded() { return upgradedToAdb_.exchange(false); }
     void RequestUpgradeForBt(const std::wstring& btName, const std::string& btMac = std::string());
@@ -170,7 +176,10 @@ public:
     // 因此可以「常驻一个备用通道」，需要换缓冲/出现卡顿时切过去：
     // 换缓冲是对静音的备用通道做的，完全不影响正在播放的声音。
     void SetDualChannel(bool on);
-    bool DualChannel() const { return dualChannel_; }
+    // UI 线程只改这个标志（原子、不碰锁），保存设置才能立刻拿到新值；
+    // 真正的备用通道清理由工作线程的 SetDualChannel 完成。
+    void SetDualChannelWant(bool on) { dualChannel_ = on; }
+    bool DualChannel() const { return dualChannel_.load(); }
 
     // ---- UI 专用读取接口（读快照，绝不等锁）----
     // 工作线程在每次任务/轮询结束时刷新快照；UI 只读快照，
@@ -308,6 +317,11 @@ public:
     void SetAutoReconnect(bool on) { autoReconnect_ = on; }
     bool AutoReconnect() const { return autoReconnect_; }
 
+    // 自动开无线 ADB（默认开）。关闭后不再自动执行 tcpip 5555；
+    // 采纳已在线的无线设备和手动配对不受影响。
+    void SetAutoArmWireless(bool on) { autoArmWireless_ = on; }
+    bool AutoArmWireless() const { return autoArmWireless_; }
+
     // 后台是否允许自动建立连接 / 自动重启会话。
     // 关掉「自动重连」后，只有启动窗口内返回 true；之后一律 false，
     // 直到用户手动点「刷新」（force）或重新启动程序。
@@ -345,10 +359,10 @@ public:
     // ---- 蓝牙引导：USB 插入时自动 arm 无线 ADB ----
     // 由主循环定期调用。发现 USB 设备 → 执行 tcpip 5555 → 记录 IP。
     void BootstrapTick();
-    bool HasWirelessEndpoint() const { return !wirelessIp_.empty(); }
-    void SetWirelessIp(const std::string& ip) { if (!ip.empty()) wirelessIp_ = ip; }
-    void ForgetWirelessIp() { wirelessIp_.clear(); }
-    std::string WirelessIp() const { return wirelessIp_; }
+    bool HasWirelessEndpoint() const { std::lock_guard<std::mutex> lk(wirelessIpMtx_); return !wirelessIp_.empty(); }
+    void SetWirelessIp(const std::string& ip) { if (ip.empty()) return; std::lock_guard<std::mutex> lk(wirelessIpMtx_); wirelessIp_ = ip; }
+    void ForgetWirelessIp() { std::lock_guard<std::mutex> lk(wirelessIpMtx_); wirelessIp_.clear(); }
+    std::string WirelessIp() const { std::lock_guard<std::mutex> lk(wirelessIpMtx_); return wirelessIp_; }
     // 蓝牙连上后尝试升级到 ADB
 
     // 查手机端是否真的有音频在播放（dumpsys audio 的 state:started）
@@ -362,10 +376,10 @@ private:
     std::string lastError_;
     std::vector<AdbDevice> devices_;
     std::string wirelessIp_;          // 已 arm 过的无线 IP
+    mutable std::mutex wirelessIpMtx_;  // UI 线程读、工作线程写，必须独立加锁
     std::wstring embeddedRoot_;       // 单文件版释放出来的工具根目录（空=分离版或释放失败）
     std::wstring embedError_;         // 释放失败原因（空=没失败）；失败时不能只报「找不到 adb.exe」
     std::map<std::string, std::vector<std::string>> identCache_;  // serial → (identity, model, btName)
-    int bootTick_ = 0;
     std::set<std::string> armedSerials_;  // 已经执行过 tcpip 5555 的设备（按设备去重）
     std::vector<AdbSession> sessions_;   // 多设备会话
     std::map<std::string, std::wstring> wanted_;   // 用户希望保持转发的设备 serial → 蓝牙名
@@ -377,13 +391,15 @@ private:
     std::map<std::string, int> dropStreak_;        // serial → 连续有丢样本的窗口数
     std::map<std::string, DWORD> lastRestartMs_;   // serial → 上次重启时刻（冷却用）
     std::map<std::string, DWORD> spawnMs_;         // serial → 本次会话启动时刻
-    std::map<std::string, DWORD> standbyRetryAt_;  // serial → 备用通道下次允许补位时刻
-    int adaptTick_ = 0;
+    std::map<std::string, ULONGLONG> standbyRetryAt_;  // serial → 备用通道下次允许补位时刻
+    PeriodicGate adaptGate_;
+    PeriodicGate bootGate_;
     bool autoAdapt_ = false;   // 默认关闭自适应
     bool shutdownDone_ = false;
     std::atomic<int> gear_{ 2 };   // 默认「标准」
-    int reconnectTick_ = 0;
-    std::map<std::string, DWORD> retryAt_;      // serial → 下次允许重试的时刻
+    PeriodicGate reconnectGate_;
+    int reconnectAttempt_ = 0;
+    std::map<std::string, ULONGLONG> retryAt_;  // serial → 下次允许重试的时刻
     std::map<std::string, int> failCount_;      // serial → 连续失败次数（退避用）
     std::set<std::string> knownWireless_;       // 已知无线设备（自动重连用）
 
@@ -391,11 +407,13 @@ private:
     mutable std::recursive_mutex mtx_;
     std::thread worker_;
     std::atomic<bool> workerQuit_{ false };
-    std::deque<std::function<void()>> queue_;
+    enum class JobKind { Generic, Critical, Probe };
+    struct QueuedJob { JobKind kind; std::function<void()> fn; };
+    std::deque<QueuedJob> queue_;
     std::mutex qmtx_;
     std::atomic<bool> upgradedToAdb_{ false };
     std::map<std::string, int> pendingBuf_;   // serial → 待生效的缓冲值
-    bool dualChannel_ = false;
+    std::atomic<bool> dualChannel_{ false };
     bool autoDual_ = false;
     int dropEvents5min_ = 0;      // 最近 5 分钟的调整次数
     DWORD dropWindowStart_ = 0;
@@ -423,8 +441,8 @@ private:
     mutable std::mutex snapMtx_;
     UiSnapshot snap_;
     void UpdateSnapshot();
-    int knownTick_ = 239;   // 故意从 239 起：第一次 tick 就触发（%240==0），
-                            // 之后才恢复 60 秒周期。否则启动后要干等一分钟才第一次连无线。
+    PeriodicGate knownGate_;
+    int knownAttempt_ = 0;
     mutable std::mutex pairMtx_;              // 只保护配对状态，绝不与 mtx_ 混用
     std::wstring pairStatus_;
     std::wstring pairEndpoint_;   // mDNS 找到的配对地址 ip:port
@@ -443,6 +461,7 @@ private:
     std::atomic<bool> quitting_{ false };     // 正在退出：RunAdb 立刻放弃等待
     std::atomic<bool> lanScan_{ false };     // 是否允许扫网段找回设备（默认关）
     std::atomic<bool> autoReconnect_{ true };  // 运行期间设备掉线是否自动连回来
+    std::atomic<bool> autoArmWireless_{ true };  // 插 USB 时是否自动执行 tcpip 5555
     // 启动窗口：程序起来后的这一小段时间算「启动阶段」，后台允许连接。
     // 窗口过后，若「自动重连」是关的，就不再有任何后台连接/自愈动作。
     std::atomic<ULONGLONG> startupUntil_{ 0 };
@@ -453,7 +472,7 @@ private:
 
     // 延迟重启：强杀 scrcpy 后设备端 server 需要时间释放音频输入，
     // 立刻重启会抢不到音频流（表现为"重启后无声"）
-    struct PendingRestart { std::string serial; DWORD dueMs; };
+    struct PendingRestart { std::string serial; ULONGLONG dueMs; };
     std::vector<PendingRestart> pending_;
     void ScheduleRestart(const std::string& serial, DWORD delayMs);
     void ProcessPendingRestarts();

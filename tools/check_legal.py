@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """许可文件一致性检查（CI 用）。
 
-存在的理由：第二轮复审抓到过一个真实漏洞 ——
-`THIRD-PARTY-NOTICES.txt` 里写「与本文件同目录：LICENSE-Apache-2.0.txt /
-LICENSE-LGPL-2.1.txt / LICENSE-Zlib.txt」，但单文件版的内嵌清单里只有其中一份，
-引用是悬空的；而 zlib 许可明文要求「本声明不得从任何源分发中移除」。
+检查 THIRD-PARTY-NOTICES 引用的许可文件是否同时存在于 dist、内嵌清单和 zip，
+避免两条打包路径出现悬空引用；同时验证 Apache 文件同文、LGPL/Zlib 文件齐全。
 
-根因是「两条打包路径的清单不同步」：dist/ 目录一份、内嵌清单一份。
 这个脚本把三处对起来：
   1. notices 里点名的每个文件，dist/ 下必须存在
   2. 同一批文件必须在 native/embed_manifest.txt 里（否则单文件版会悬空）
